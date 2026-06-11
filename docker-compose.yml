@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  webcut-dev:
+    build: .
+    container_name: webcut_container
+    volumes:
+      - .:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      - HOST=0.0.0.0
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} # Passes your API key from Windows to the container
+    command: sh -c "npm install --no-audit --no-fund && npm run dev"
+    stdin_open: true
+    tty: true
