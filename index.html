@@ -5,6 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <title>WebCut — Local-First Video Editor</title>
+    <!--
+      Restores cross-origin isolation on static hosts that cannot send
+      COOP/COEP response headers (e.g. GitHub Pages). Registers a service
+      worker that re-serves same-origin responses with those headers, which
+      re-enables SharedArrayBuffer → onnxruntime-web multithreaded WASM.
+      No-op (and harmless) when the host already sends the headers, as the
+      Vite dev/preview servers do.
+    -->
+    <script src="./coi-serviceworker.js"></script>
   </head>
   <body>
     <div id="root"></div>
