@@ -1,7 +1,8 @@
 name: Deploy to GitHub Pages
 
 # Builds the Vite app and publishes the static `dist/` to GitHub Pages.
-# Enable once in the repo: Settings → Pages → Build and deployment → Source: GitHub Actions.
+# `configure-pages` (enablement: true) turns Pages on with the GitHub Actions
+# build type on first run, so no manual repo setting is required.
 
 on:
   push:
@@ -40,6 +41,10 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        with:
+          # Enable Pages (GitHub Actions build type) if it isn't already,
+          # so the deploy doesn't require a manual repo setting.
+          enablement: true
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
