@@ -13,6 +13,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
@@ -111,12 +112,14 @@ const ClipBlock = ({
   pixelsPerFrame,
   selected,
   onPointerDown,
+  onContextMenu,
 }: {
   item: TrackItem;
   track: Track;
   pixelsPerFrame: number;
   selected: boolean;
   onPointerDown: (event: ReactPointerEvent, item: TrackItem, mode: DragMode) => void;
+  onContextMenu: (event: ReactMouseEvent, item: TrackItem) => void;
 }) => {
   const style: CSSProperties = {
     left: item.startFrame * pixelsPerFrame,
@@ -128,6 +131,7 @@ const ClipBlock = ({
     <div
       data-clip-id={item.id}
       onPointerDown={(event) => onPointerDown(event, item, "move")}
+      onContextMenu={(event) => onContextMenu(event, item)}
       className={`absolute top-1 cursor-grab touch-none overflow-hidden rounded border ${ITEM_COLORS[item.type]} ${
         selected ? "ring-2 ring-white/80" : ""
       } ${item.locked ? "opacity-50" : ""}`}
@@ -213,12 +217,14 @@ export const Timeline = () => {
   const splitItemAtFrame = useTimelineStore((state) => state.splitItemAtFrame);
   const setSelection = useTimelineStore((state) => state.setSelection);
   const removeItems = useTimelineStore((state) => state.removeItems);
+  const rippleDelete = useTimelineStore((state) => state.rippleDelete);
   const addTrack = useTimelineStore((state) => state.addTrack);
 
   const displayFrame = useTransportFrame();
   const [isPlaying, setIsPlaying] = useState(false);
   const [snapping, setSnapping] = useState(true);
   const [scrollLeft, setScrollLeft] = useState(0);
+  const [menu, setMenu] = useState<{ x: number; y: number; item: TrackItem } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -292,8 +298,33 @@ export const Timeline = () => {
 
   // -- Clip drag / trim / razor ----------------------------------------------
 
+  const openMenu = useCallback(
+    (event: ReactMouseEvent, item: TrackItem) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const selection = useTimelineStore.getState().selectedItemIds;
+      if (!selection.includes(item.id)) setSelection([item.id]);
+      setMenu({ x: event.clientX, y: event.clientY, item });
+    },
+    [setSelection],
+  );
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("resize", close);
+    };
+  }, [menu]);
+
   const onClipPointerDown = (event: ReactPointerEvent, item: TrackItem, mode: DragMode) => {
     event.stopPropagation();
+    if (event.button === 2) return; // right-click opens the context menu, not a drag
     if (item.locked) return;
 
     if (activeTool === "razor") {
@@ -348,6 +379,42 @@ export const Timeline = () => {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+      const store = useTimelineStore.getState();
+
+      // Modifier combos: undo/redo + clipboard. Handled before the plain-key
+      // switch so Ctrl+C/V don't collide with the razor/select tool keys.
+      if (event.metaKey || event.ctrlKey) {
+        switch (event.code) {
+          case "KeyZ":
+            event.preventDefault();
+            if (event.shiftKey) store.redo();
+            else store.undo();
+            return;
+          case "KeyY":
+            event.preventDefault();
+            store.redo();
+            return;
+          case "KeyC":
+            event.preventDefault();
+            store.copySelection();
+            return;
+          case "KeyX":
+            event.preventDefault();
+            store.cutSelection();
+            return;
+          case "KeyV":
+            event.preventDefault();
+            store.pasteClipboard();
+            return;
+          case "KeyD":
+            event.preventDefault();
+            store.duplicateSelection();
+            return;
+          default:
+            return;
+        }
+      }
+
       switch (event.code) {
         case "Space":
           event.preventDefault();
@@ -363,15 +430,18 @@ export const Timeline = () => {
           transport.setFrame(0);
           break;
         case "KeyV":
-          useTimelineStore.getState().setActiveTool("select");
+          store.setActiveTool("select");
           break;
         case "KeyC":
-          useTimelineStore.getState().setActiveTool("razor");
+          store.setActiveTool("razor");
           break;
         case "Delete":
         case "Backspace": {
-          const { selectedItemIds: selection, removeItems: remove } = useTimelineStore.getState();
-          if (selection.length > 0) remove(selection);
+          if (store.selectedItemIds.length > 0) {
+            // Shift+Delete ripples (closes the gap); plain Delete leaves it.
+            if (event.shiftKey) store.rippleDelete(store.selectedItemIds);
+            else store.removeItems(store.selectedItemIds);
+          }
           break;
         }
       }
@@ -460,12 +530,21 @@ export const Timeline = () => {
         <div className="flex-1" />
 
         {selectedItemIds.length > 0 && (
-          <button
-            onClick={() => removeItems(selectedItemIds)}
-            className="mr-2 rounded px-2 py-0.5 text-[11px] text-red-400 hover:bg-panel-raised"
-          >
-            Delete {selectedItemIds.length} item{selectedItemIds.length > 1 ? "s" : ""}
-          </button>
+          <>
+            <button
+              onClick={() => rippleDelete(selectedItemIds)}
+              title="Ripple delete — remove and close the gap (Shift+Del)"
+              className="rounded px-2 py-0.5 text-[11px] text-amber-400 hover:bg-panel-raised"
+            >
+              Ripple
+            </button>
+            <button
+              onClick={() => removeItems(selectedItemIds)}
+              className="mr-2 rounded px-2 py-0.5 text-[11px] text-red-400 hover:bg-panel-raised"
+            >
+              Delete {selectedItemIds.length} item{selectedItemIds.length > 1 ? "s" : ""}
+            </button>
+          </>
         )}
 
         <button title="Zoom out" onClick={() => zoomBy(1 / 1.4)} className="rounded p-1.5 text-neutral-400 hover:bg-panel-raised">
@@ -531,6 +610,7 @@ export const Timeline = () => {
                       pixelsPerFrame={pixelsPerFrame}
                       selected={selectedItemIds.includes(item.id)}
                       onPointerDown={onClipPointerDown}
+                      onContextMenu={openMenu}
                     />
                   ))}
                 </div>
@@ -539,6 +619,55 @@ export const Timeline = () => {
           </div>
         </div>
       </div>
+
+      {menu && (
+        <div
+          className="fixed z-50 min-w-[168px] rounded border border-edge bg-panel py-1 text-xs shadow-xl shadow-black/50"
+          style={{ left: menu.x, top: menu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          {[
+            {
+              label: "Split at playhead",
+              run: () => splitItemAtFrame(menu.item.id, Math.round(transport.getFrame())),
+            },
+            {
+              label: "Duplicate",
+              run: () => {
+                setSelection([menu.item.id]);
+                useTimelineStore.getState().duplicateSelection();
+              },
+            },
+            {
+              label: "Copy",
+              run: () => {
+                setSelection([menu.item.id]);
+                useTimelineStore.getState().copySelection();
+              },
+            },
+            {
+              label: "Cut",
+              run: () => {
+                setSelection([menu.item.id]);
+                useTimelineStore.getState().cutSelection();
+              },
+            },
+            { label: "Delete", run: () => removeItems([menu.item.id]) },
+            { label: "Ripple delete", run: () => rippleDelete([menu.item.id]) },
+          ].map((entry) => (
+            <button
+              key={entry.label}
+              onClick={() => {
+                entry.run();
+                setMenu(null);
+              }}
+              className="block w-full px-3 py-1.5 text-left text-neutral-300 hover:bg-panel-raised"
+            >
+              {entry.label}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 };
