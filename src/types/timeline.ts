@@ -210,6 +210,48 @@ export interface TextItem extends TrackItemBase {
 
 export type TrackItem = ClipItem | ShapeItem | TextItem;
 
+/** True for items composited as overlays (rendered from vector/text, not media). */
+export const isOverlayItem = (item: TrackItem): item is TextItem | ShapeItem =>
+  item.type === "text" || item.type === "shape";
+
+/** Factory: a text overlay with sensible defaults, ready for `addItemToTrack`. */
+export const makeTextItem = (startFrame: number, durationFrames: number): Omit<TextItem, "id"> => ({
+  type: "text",
+  name: "Text",
+  startFrame,
+  durationFrames,
+  transform: identityTransform(),
+  effects: [],
+  locked: false,
+  text: "New text",
+  fontFamily: "Inter, system-ui, sans-serif",
+  fontSizePx: 96,
+  fontWeight: 700,
+  fillColor: "#ffffff",
+  alignment: "center",
+  lineHeight: 1.2,
+});
+
+/** Factory: a shape overlay with sensible defaults, ready for `addItemToTrack`. */
+export const makeShapeItem = (
+  shape: ShapeItem["shape"],
+  startFrame: number,
+  durationFrames: number,
+): Omit<ShapeItem, "id"> => ({
+  type: "shape",
+  name: shape.charAt(0).toUpperCase() + shape.slice(1),
+  startFrame,
+  durationFrames,
+  transform: identityTransform(),
+  effects: [],
+  locked: false,
+  shape,
+  fillColor: "#4f8cff",
+  strokeColor: "#ffffff",
+  strokeWidthPx: 0,
+  cornerRadiusPx: 0,
+});
+
 // ---------------------------------------------------------------------------
 // Tracks
 // ---------------------------------------------------------------------------
@@ -241,6 +283,22 @@ export interface ProjectSettings {
   readonly sampleRate: number;
   readonly backgroundColor: string;
 }
+
+/** Common canvas presets for quick aspect-ratio switching. */
+export interface AspectPreset {
+  readonly label: string;
+  readonly width: number;
+  readonly height: number;
+}
+
+export const ASPECT_PRESETS: readonly AspectPreset[] = [
+  { label: "16:9 · 1920×1080", width: 1920, height: 1080 },
+  { label: "9:16 · 1080×1920", width: 1080, height: 1920 },
+  { label: "1:1 · 1080×1080", width: 1080, height: 1080 },
+  { label: "4:5 · 1080×1350", width: 1080, height: 1350 },
+  { label: "4:3 · 1440×1080", width: 1440, height: 1080 },
+  { label: "21:9 · 2560×1080", width: 2560, height: 1080 },
+];
 
 export interface Project {
   readonly id: ProjectId;

@@ -17,12 +17,27 @@ import { fileSystemService } from "./FileSystemService";
 import { transport, useTimelineStore } from "../store/timelineStore";
 import {
   defaultCorridorKeyParams,
+  isOverlayItem,
+  sampleAnimatable,
   type ClipItem,
   type CorridorKeyParams,
   type MediaAsset,
   type MediaAssetId,
   type Project,
+  type ProjectSettings,
+  type ShapeItem,
+  type TextItem,
+  type Vec2,
 } from "../types/timeline";
+
+type OverlayItem = TextItem | ShapeItem;
+
+interface SampledTransform {
+  readonly pos: Vec2;
+  readonly scale: Vec2;
+  readonly rotation: number;
+  readonly opacity: number;
+}
 
 export interface FrameSink {
   ingestLayerFrame(layerId: string, frame: VideoFrame | HTMLVideoElement | ImageBitmap, order: number): void;
@@ -40,7 +55,15 @@ interface ActiveLayerClip {
   readonly clip: ClipItem;
   readonly asset: MediaAsset;
   readonly trackId: string;
+  readonly trackMuted: boolean;
   /** Compositing order: ascending = bottom -> top. */
+  readonly order: number;
+}
+
+interface ActiveOverlay {
+  readonly item: OverlayItem;
+  /** Own layer id (per-item, so multiple overlays can share a track). */
+  readonly layerId: string;
   readonly order: number;
 }
 
@@ -62,12 +85,35 @@ const resolveActiveClips = (project: Project, frame: number): ActiveLayerClip[] 
       if (wholeFrame < item.startFrame || wholeFrame >= item.startFrame + item.durationFrames) continue;
       const asset = project.assets.find((candidate) => candidate.id === item.assetId);
       if (!asset || asset.kind === "audio") continue;
-      layers.push({ clip: item, asset, trackId: track.id, order: track.index });
+      layers.push({ clip: item, asset, trackId: track.id, trackMuted: track.muted, order: track.index });
       break;
     }
   }
   return layers;
 };
+
+/** Text/shape overlays under the playhead, each its own compositing layer. */
+const resolveActiveOverlays = (project: Project, frame: number): ActiveOverlay[] => {
+  const wholeFrame = Math.floor(frame);
+  const overlays: ActiveOverlay[] = [];
+  const visualTracks = project.tracks
+    .filter((track) => track.kind === "video" && !track.hidden)
+    .sort((a, b) => a.index - b.index);
+  for (const track of visualTracks) {
+    let localIndex = 0;
+    for (const item of track.items) {
+      if (!isOverlayItem(item)) continue;
+      if (wholeFrame < item.startFrame || wholeFrame >= item.startFrame + item.durationFrames) continue;
+      // Overlays composite above clips on the same track; later items on top.
+      overlays.push({ item, layerId: item.id, order: track.index + 0.5 + localIndex * 0.001 });
+      localIndex += 1;
+    }
+  }
+  return overlays;
+};
+
+/** Linear gain [0,1] from a dB value, clamped to what an <audio> element allows. */
+const dbToVolume = (gainDb: number): number => Math.min(1, Math.max(0, Math.pow(10, gainDb / 20)));
 
 const corridorKeyOf = (clip: ClipItem): { enabled: boolean; params: CorridorKeyParams } => {
   const effect = clip.effects.find((candidate) => candidate.type === "corridor-key");
@@ -82,6 +128,9 @@ class PreviewService {
   private videoElements = new Map<string, RVFCVideo>();
   private imageBitmaps = new Map<MediaAssetId, ImageBitmap>();
   private objectUrls = new Map<string, string>();
+  /** Rasterized overlays, keyed by item id → { signature, premultiplied bitmap }. */
+  private overlayCache = new Map<string, { sig: string; bitmap: ImageBitmap }>();
+  private overlayCanvas: HTMLCanvasElement | null = null;
 
   private rvfcLoops = new Map<RVFCVideo, { handle: number; layerId: string; order: number }>();
   private unsubscribeTransport: (() => void) | null = null;
@@ -122,8 +171,20 @@ class PreviewService {
     const frame = transport.getFrame();
     const fps = project.settings.frameRate;
     const actives = resolveActiveClips(project, frame);
+    const overlays = resolveActiveOverlays(project, frame);
 
-    sink.syncLayers(actives.map((layer) => layer.trackId));
+    sink.syncLayers([...actives.map((layer) => layer.trackId), ...overlays.map((o) => o.layerId)]);
+
+    // Overlays (text/shape): rasterize to a premultiplied bitmap and ingest as
+    // an alpha layer. The compositor's disabled-key path forwards source alpha,
+    // so transparent regions composite correctly over lower layers.
+    const activeOverlayIds = new Set(overlays.map((o) => o.layerId));
+    this.pruneOverlayCache(activeOverlayIds);
+    for (const { item, layerId, order } of overlays) {
+      sink.setLayerEffect(layerId, false, defaultCorridorKeyParams());
+      const bitmap = await this.getOverlayBitmap(item, project.settings, frame);
+      if (bitmap) sink.ingestLayerFrame(layerId, bitmap, order);
+    }
 
     if (actives.length === 0) {
       this.stopAllRvfcLoops();
@@ -134,7 +195,7 @@ class PreviewService {
     const playing = transport.isPlaying();
     const keepVideos = new Set<RVFCVideo>();
 
-    for (const { clip, asset, trackId, order } of actives) {
+    for (const { clip, asset, trackId, trackMuted, order } of actives) {
       const key = corridorKeyOf(clip);
       sink.setLayerEffect(trackId, key.enabled, key.params);
 
@@ -149,6 +210,10 @@ class PreviewService {
       const video = await this.getVideoElement(asset, `${trackId}:${asset.handleKey}`);
       if (!video) continue;
       keepVideos.add(video);
+
+      // Per-clip audio: apply gain + mute (track mute overrides).
+      video.muted = clip.audioMuted || trackMuted;
+      video.volume = dbToVolume(clip.audioGainDb);
 
       const localFrame = frame - clip.startFrame;
       const mediaTimeS = (clip.sourceInFrame + localFrame * clip.speed) / fps;
@@ -282,6 +347,73 @@ class PreviewService {
     }
   }
 
+  // -- overlay rasterization --------------------------------------------------
+
+  private async getOverlayBitmap(
+    item: OverlayItem,
+    settings: ProjectSettings,
+    frame: number,
+  ): Promise<ImageBitmap | null> {
+    const local = Math.max(0, frame - item.startFrame);
+    const t: SampledTransform = {
+      pos: sampleAnimatable(item.transform.position, local),
+      scale: sampleAnimatable(item.transform.scale, local),
+      rotation: sampleAnimatable(item.transform.rotation, local),
+      opacity: sampleAnimatable(item.transform.opacity, local),
+    };
+    const sig = overlaySignature(item, settings, t);
+    const cached = this.overlayCache.get(item.id);
+    if (cached && cached.sig === sig) return cached.bitmap;
+    try {
+      const bitmap = await this.rasterizeOverlay(item, settings, t);
+      cached?.bitmap.close();
+      this.overlayCache.set(item.id, { sig, bitmap });
+      return bitmap;
+    } catch (error) {
+      console.error("[WebCut] overlay render failed:", error);
+      return cached?.bitmap ?? null;
+    }
+  }
+
+  private async rasterizeOverlay(
+    item: OverlayItem,
+    settings: ProjectSettings,
+    t: SampledTransform,
+  ): Promise<ImageBitmap> {
+    const w = settings.width;
+    const h = settings.height;
+    let canvas = this.overlayCanvas;
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+      this.overlayCanvas = canvas;
+    }
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("2D canvas context unavailable");
+    ctx.clearRect(0, 0, w, h);
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, Math.max(0, t.opacity));
+    // Transform: position is relative to canvas center; scale/rotate about it.
+    ctx.translate(w / 2 + t.pos.x, h / 2 + t.pos.y);
+    ctx.rotate((t.rotation * Math.PI) / 180);
+    ctx.scale(t.scale.x, t.scale.y);
+    if (item.type === "text") drawTextItem(ctx, item);
+    else drawShapeItem(ctx, item, w, h);
+    ctx.restore();
+    // Premultiply so the compositor's premultiplied "over" blend is correct.
+    return createImageBitmap(canvas, { premultiplyAlpha: "premultiply" });
+  }
+
+  private pruneOverlayCache(active: ReadonlySet<string>): void {
+    for (const [id, entry] of this.overlayCache) {
+      if (!active.has(id)) {
+        entry.bitmap.close();
+        this.overlayCache.delete(id);
+      }
+    }
+  }
+
   dispose(): void {
     this.stopAllRvfcLoops();
     for (const video of this.videoElements.values()) {
@@ -291,11 +423,67 @@ class PreviewService {
     }
     for (const url of this.objectUrls.values()) URL.revokeObjectURL(url);
     for (const bitmap of this.imageBitmaps.values()) bitmap.close();
+    for (const entry of this.overlayCache.values()) entry.bitmap.close();
     this.videoElements.clear();
     this.imageBitmaps.clear();
     this.objectUrls.clear();
+    this.overlayCache.clear();
   }
 }
+
+// -- overlay drawing (module-level, pure) ------------------------------------
+
+const overlaySignature = (item: OverlayItem, settings: ProjectSettings, t: SampledTransform): string => {
+  const base = `${settings.width}x${settings.height}|${t.pos.x},${t.pos.y}|${t.scale.x},${t.scale.y}|${t.rotation}|${t.opacity}`;
+  if (item.type === "text") {
+    return `text|${base}|${item.text}|${item.fontFamily}|${item.fontSizePx}|${item.fontWeight}|${item.fillColor}|${item.alignment}|${item.lineHeight}`;
+  }
+  return `shape|${base}|${item.shape}|${item.fillColor}|${item.strokeColor}|${item.strokeWidthPx}|${item.cornerRadiusPx}`;
+};
+
+const drawTextItem = (ctx: CanvasRenderingContext2D, item: TextItem): void => {
+  ctx.fillStyle = item.fillColor;
+  ctx.textAlign = item.alignment;
+  ctx.textBaseline = "middle";
+  ctx.font = `${item.fontWeight} ${item.fontSizePx}px ${item.fontFamily}`;
+  const lines = item.text.split("\n");
+  const lineHeight = item.fontSizePx * item.lineHeight;
+  let y = -((lines.length - 1) * lineHeight) / 2;
+  for (const line of lines) {
+    ctx.fillText(line, 0, y);
+    y += lineHeight;
+  }
+};
+
+const drawShapeItem = (ctx: CanvasRenderingContext2D, item: ShapeItem, w: number, h: number): void => {
+  // Shapes carry no explicit size — a base extent (40% of the short side) is
+  // scaled by the item's transform for sizing.
+  const base = Math.min(w, h) * 0.4;
+  ctx.fillStyle = item.fillColor;
+  ctx.strokeStyle = item.strokeColor;
+  ctx.lineWidth = item.strokeWidthPx;
+  if (item.shape === "rectangle") {
+    ctx.beginPath();
+    if (item.cornerRadiusPx > 0 && typeof ctx.roundRect === "function") {
+      ctx.roundRect(-base / 2, -base / 2, base, base, item.cornerRadiusPx);
+    } else {
+      ctx.rect(-base / 2, -base / 2, base, base);
+    }
+    ctx.fill();
+    if (item.strokeWidthPx > 0) ctx.stroke();
+  } else if (item.shape === "ellipse") {
+    ctx.beginPath();
+    ctx.ellipse(0, 0, base / 2, base / 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+    if (item.strokeWidthPx > 0) ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(-base / 2, 0);
+    ctx.lineTo(base / 2, 0);
+    ctx.lineWidth = Math.max(2, item.strokeWidthPx);
+    ctx.stroke();
+  }
+};
 
 export const previewService = new PreviewService();
 

@@ -8,8 +8,9 @@
  *  └──────────────────────────────────────────────────────────────┘
  */
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  Circle,
   Clapperboard,
   FileAudio,
   FileVideo,
@@ -20,23 +21,41 @@ import {
   Save,
   SlidersHorizontal,
   Sparkles,
+  Square,
+  Type,
 } from "lucide-react";
 import { VideoPlayer } from "./VideoPlayer";
 import { Timeline } from "./Timeline";
 import { fileSystemService, isUserAbort } from "../services/FileSystemService";
 import { transport, useTimelineStore } from "../store/timelineStore";
 import {
+  ASPECT_PRESETS,
   createId,
   defaultCorridorKeyParams,
   identityTransform,
+  makeShapeItem,
+  makeTextItem,
+  sampleAnimatable,
+  staticValue,
+  type ClipItem,
   type CorridorKeyParams,
   type Effect,
   type EffectId,
   type MediaAsset,
   type MediaAssetId,
   type MediaKind,
+  type ShapeItem,
+  type TextItem,
   type TrackItem,
+  type TrackItemId,
+  type Transform,
+  type Vec2,
 } from "../types/timeline";
+
+/** Signature of the store's generic item updater, shared by Inspector sections. */
+type UpdateItemFn = (itemId: TrackItemId, updater: (item: TrackItem) => TrackItem, coalesceKey?: string) => void;
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
 
 // ---------------------------------------------------------------------------
 // Media probing
@@ -99,6 +118,25 @@ const MEDIA_ICONS: Record<MediaKind, typeof FileVideo> = {
   image: ImageIcon,
 };
 
+const InsertButton = ({
+  icon,
+  label,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+}) => (
+  <button
+    onClick={onClick}
+    title={`Add ${label} at playhead`}
+    className="flex flex-col items-center gap-0.5 rounded border border-edge bg-panel-raised px-1 py-1.5 text-[9px] text-neutral-300 hover:border-accent/60"
+  >
+    {icon}
+    {label}
+  </button>
+);
+
 // ---------------------------------------------------------------------------
 // Media pool (left panel)
 // ---------------------------------------------------------------------------
@@ -109,8 +147,22 @@ const MediaPool = () => {
   const frameRate = useTimelineStore((state) => state.project.settings.frameRate);
   const addAsset = useTimelineStore((state) => state.addAsset);
   const addClipToTrack = useTimelineStore((state) => state.addClipToTrack);
+  const addItemToTrack = useTimelineStore((state) => state.addItemToTrack);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const insertOverlay = useCallback(
+    (factory: (start: number, duration: number) => Omit<TrackItem, "id">) => {
+      const armedId = useTimelineStore.getState().armedTrackId;
+      const armed = tracks.find((t) => t.id === armedId && t.kind === "video" && !t.locked);
+      const track = armed ?? tracks.find((t) => t.kind === "video" && !t.locked);
+      if (!track) return;
+      const start = Math.round(transport.getFrame());
+      const duration = Math.max(1, Math.round(3 * frameRate));
+      addItemToTrack(track.id, factory(start, duration));
+    },
+    [tracks, frameRate, addItemToTrack],
+  );
 
   const handleImport = useCallback(async () => {
     setImporting(true);
@@ -187,6 +239,19 @@ const MediaPool = () => {
           {importing ? "Importing…" : "Import Media"}
         </button>
         {error && <p className="mt-2 text-[10px] leading-snug text-red-400">{error}</p>}
+        <div className="mt-2 grid grid-cols-3 gap-1">
+          <InsertButton icon={<Type size={12} />} label="Text" onClick={() => insertOverlay(makeTextItem)} />
+          <InsertButton
+            icon={<Square size={12} />}
+            label="Rect"
+            onClick={() => insertOverlay((s, d) => makeShapeItem("rectangle", s, d))}
+          />
+          <InsertButton
+            icon={<Circle size={12} />}
+            label="Ellipse"
+            onClick={() => insertOverlay((s, d) => makeShapeItem("ellipse", s, d))}
+          />
+        </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
         {assets.length === 0 && (
@@ -260,10 +325,261 @@ const SliderRow = ({
   </label>
 );
 
+const Section = ({ title, children }: { title: string; children: React.ReactNode }) => (
+  <div className="mb-4">
+    <p className="mb-2 text-[11px] font-semibold tracking-wide text-neutral-400">{title.toUpperCase()}</p>
+    <div className="rounded border border-edge bg-panel/40 p-2.5">{children}</div>
+  </div>
+);
+
+const NumberField = ({
+  label,
+  value,
+  step = 1,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  step?: number;
+  onChange: (value: number) => void;
+}) => (
+  <label className="block">
+    <span className="mb-0.5 block text-[9px] uppercase tracking-wide text-neutral-500">{label}</span>
+    <input
+      type="number"
+      value={Number.isFinite(value) ? round2(value) : 0}
+      step={step}
+      onChange={(event) => {
+        const next = Number(event.target.value);
+        if (Number.isFinite(next)) onChange(next);
+      }}
+      className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200 outline-none focus:border-accent/60"
+    />
+  </label>
+);
+
+const ColorInput = ({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) => (
+  <label className="flex items-center gap-1.5 text-[10px] text-neutral-400">
+    {label}
+    <input
+      type="color"
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      className="h-6 w-8 cursor-pointer rounded border border-edge bg-transparent"
+    />
+  </label>
+);
+
+const TransformSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
+  const pos = sampleAnimatable(item.transform.position, 0);
+  const scale = sampleAnimatable(item.transform.scale, 0);
+  const rotation = sampleAnimatable(item.transform.rotation, 0);
+  const opacity = sampleAnimatable(item.transform.opacity, 0);
+  const setTransform = (patch: Partial<Transform>) =>
+    updateItem(item.id, (it) => ({ ...it, transform: { ...it.transform, ...patch } }) as TrackItem, "transform");
+  const setPosition = (next: Vec2) => setTransform({ position: staticValue(next) });
+  const setScale = (next: Vec2) => setTransform({ scale: staticValue(next) });
+  return (
+    <Section title="Transform">
+      <div className="grid grid-cols-2 gap-2">
+        <NumberField label="X" value={pos.x} onChange={(x) => setPosition({ x, y: pos.y })} />
+        <NumberField label="Y" value={pos.y} onChange={(y) => setPosition({ x: pos.x, y })} />
+        <NumberField label="Scale X" value={scale.x} step={0.01} onChange={(x) => setScale({ x, y: scale.y })} />
+        <NumberField label="Scale Y" value={scale.y} step={0.01} onChange={(y) => setScale({ x: scale.x, y })} />
+        <NumberField
+          label="Rotation°"
+          value={rotation}
+          onChange={(r) => setTransform({ rotation: staticValue(r) })}
+        />
+      </div>
+      <div className="mt-1">
+        <SliderRow
+          label="Opacity"
+          value={opacity}
+          min={0}
+          max={1}
+          step={0.01}
+          onChange={(o) => setTransform({ opacity: staticValue(o) })}
+        />
+      </div>
+    </Section>
+  );
+};
+
+const TextSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
+  if (item.type !== "text") return null;
+  const set = (patch: Partial<TextItem>) =>
+    updateItem(item.id, (it) => (it.type === "text" ? { ...it, ...patch } : it), "text");
+  return (
+    <Section title="Text">
+      <textarea
+        value={item.text}
+        rows={2}
+        onChange={(event) => set({ text: event.target.value })}
+        className="mb-2 w-full resize-none rounded border border-edge bg-panel-raised px-2 py-1 text-[11px] text-neutral-200 outline-none focus:border-accent/60"
+      />
+      <div className="grid grid-cols-2 gap-2">
+        <NumberField label="Size" value={item.fontSizePx} onChange={(v) => set({ fontSizePx: Math.max(1, v) })} />
+        <label className="block">
+          <span className="mb-0.5 block text-[9px] uppercase tracking-wide text-neutral-500">Weight</span>
+          <select
+            value={item.fontWeight}
+            onChange={(event) => set({ fontWeight: Number(event.target.value) })}
+            className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200"
+          >
+            <option value={400}>Regular</option>
+            <option value={600}>Semibold</option>
+            <option value={700}>Bold</option>
+            <option value={900}>Black</option>
+          </select>
+        </label>
+      </div>
+      <div className="mt-2 flex items-center justify-between">
+        <ColorInput label="Fill" value={item.fillColor} onChange={(v) => set({ fillColor: v })} />
+        <div className="flex gap-1">
+          {(["left", "center", "right"] as const).map((align) => (
+            <button
+              key={align}
+              onClick={() => set({ alignment: align })}
+              className={`rounded px-2 py-1 text-[10px] ${
+                item.alignment === align ? "bg-accent/25 text-accent" : "text-neutral-400 hover:bg-panel-raised"
+              }`}
+            >
+              {align[0].toUpperCase()}
+            </button>
+          ))}
+        </div>
+      </div>
+    </Section>
+  );
+};
+
+const ShapeSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
+  if (item.type !== "shape") return null;
+  const set = (patch: Partial<ShapeItem>) =>
+    updateItem(item.id, (it) => (it.type === "shape" ? { ...it, ...patch } : it), "shape");
+  return (
+    <Section title="Shape">
+      <div className="flex items-center justify-between">
+        <ColorInput label="Fill" value={item.fillColor} onChange={(v) => set({ fillColor: v })} />
+        <ColorInput label="Stroke" value={item.strokeColor} onChange={(v) => set({ strokeColor: v })} />
+      </div>
+      <div className="mt-2 grid grid-cols-2 gap-2">
+        <NumberField label="Stroke px" value={item.strokeWidthPx} onChange={(v) => set({ strokeWidthPx: Math.max(0, v) })} />
+        <NumberField
+          label="Corner px"
+          value={item.cornerRadiusPx}
+          onChange={(v) => set({ cornerRadiusPx: Math.max(0, v) })}
+        />
+      </div>
+    </Section>
+  );
+};
+
+const ClipSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
+  if (item.type !== "clip") return null;
+  const setSpeed = (speed: number) =>
+    updateItem(
+      item.id,
+      (it) => {
+        if (it.type !== "clip") return it;
+        const target = Math.abs(speed) < 0.1 ? 0.1 : speed;
+        // Preserve the source range: sourceFrames = timelineDuration × |speed|.
+        const sourceFrames = it.durationFrames * Math.abs(it.speed || 1);
+        return { ...it, speed: target, durationFrames: Math.max(1, Math.round(sourceFrames / Math.abs(target))) };
+      },
+      "speed",
+    );
+  const setAudio = (patch: Partial<Pick<ClipItem, "audioGainDb" | "audioMuted">>) =>
+    updateItem(item.id, (it) => (it.type === "clip" ? { ...it, ...patch } : it), "audio");
+  return (
+    <Section title="Clip">
+      <SliderRow label="Speed ×" value={item.speed} min={0.25} max={4} step={0.05} onChange={setSpeed} />
+      <SliderRow
+        label="Volume (dB)"
+        value={item.audioGainDb}
+        min={-30}
+        max={6}
+        step={0.5}
+        onChange={(v) => setAudio({ audioGainDb: v })}
+      />
+      <label className="flex items-center gap-2 pt-1 text-[10px] text-neutral-400">
+        <input
+          type="checkbox"
+          checked={item.audioMuted}
+          onChange={(event) => setAudio({ audioMuted: event.target.checked })}
+          className="accent-(--color-accent)"
+        />
+        Mute clip audio
+      </label>
+    </Section>
+  );
+};
+
+const ProjectSettingsSection = () => {
+  const settings = useTimelineStore((state) => state.project.settings);
+  const setProjectSettings = useTimelineStore((state) => state.setProjectSettings);
+  const current = `${settings.width}x${settings.height}`;
+  const isPreset = ASPECT_PRESETS.some((preset) => `${preset.width}x${preset.height}` === current);
+  return (
+    <div className="pt-2">
+      <p className="mb-2 text-[11px] font-semibold tracking-wide text-neutral-400">PROJECT</p>
+      <div className="rounded border border-edge bg-panel/40 p-2.5">
+        <label className="mb-2 block">
+          <span className="mb-1 block text-[10px] text-neutral-400">Aspect / resolution</span>
+          <select
+            value={current}
+            onChange={(event) => {
+              const preset = ASPECT_PRESETS.find((x) => `${x.width}x${x.height}` === event.target.value);
+              if (preset) setProjectSettings({ width: preset.width, height: preset.height });
+            }}
+            className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200"
+          >
+            {!isPreset && (
+              <option value={current}>
+                Custom · {settings.width}×{settings.height}
+              </option>
+            )}
+            {ASPECT_PRESETS.map((preset) => (
+              <option key={preset.label} value={`${preset.width}x${preset.height}`}>
+                {preset.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          <NumberField
+            label="Width"
+            value={settings.width}
+            onChange={(v) => setProjectSettings({ width: Math.max(16, Math.round(v)) })}
+          />
+          <NumberField
+            label="Height"
+            value={settings.height}
+            onChange={(v) => setProjectSettings({ height: Math.max(16, Math.round(v)) })}
+          />
+        </div>
+        <p className="mt-3 text-center text-[10px] leading-relaxed text-neutral-600">
+          Select a clip, text, or shape on the timeline to edit its properties.
+        </p>
+      </div>
+    </div>
+  );
+};
+
 const Inspector = () => {
   const selectedItemIds = useTimelineStore((state) => state.selectedItemIds);
   const tracks = useTimelineStore((state) => state.project.tracks);
   const updateItemEffects = useTimelineStore((state) => state.updateItemEffects);
+  const updateItem = useTimelineStore((state) => state.updateItem);
 
   const selectedItem = useMemo(() => {
     if (selectedItemIds.length !== 1) return undefined;
@@ -304,11 +620,7 @@ const Inspector = () => {
     <div className="flex h-full flex-col">
       <PanelTitle icon={<SlidersHorizontal size={13} />} title="Inspector" />
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        {!selectedItem && (
-          <p className="pt-4 text-center text-[11px] leading-relaxed text-neutral-600">
-            Select a clip on the timeline to edit its properties.
-          </p>
-        )}
+        {!selectedItem && <ProjectSettingsSection />}
 
         {selectedItem && (
           <>
@@ -317,12 +629,19 @@ const Inspector = () => {
               {selectedItem.durationFrames}f @ frame {selectedItem.startFrame}
             </p>
 
-            <div className="mb-3 flex items-center gap-2">
-              <Sparkles size={13} className="text-accent-warm" />
-              <span className="text-[11px] font-semibold tracking-wide text-neutral-300">CORRIDORKEY MATTE</span>
-            </div>
+            <TransformSection item={selectedItem} updateItem={updateItem} />
+            <TextSection item={selectedItem} updateItem={updateItem} />
+            <ShapeSection item={selectedItem} updateItem={updateItem} />
+            <ClipSection item={selectedItem} updateItem={updateItem} />
 
-            {!corridorKey && (
+            {selectedItem.type === "clip" && (
+              <div className="mb-3 mt-1 flex items-center gap-2">
+                <Sparkles size={13} className="text-accent-warm" />
+                <span className="text-[11px] font-semibold tracking-wide text-neutral-300">CORRIDORKEY MATTE</span>
+              </div>
+            )}
+
+            {selectedItem.type === "clip" && !corridorKey && (
               <button
                 onClick={() => applyKeyParams({})}
                 className="w-full rounded border border-edge bg-panel-raised px-3 py-1.5 text-xs text-neutral-200 hover:border-accent/60"
@@ -331,7 +650,7 @@ const Inspector = () => {
               </button>
             )}
 
-            {corridorKey && (
+            {selectedItem.type === "clip" && corridorKey && (
               <div className="rounded border border-edge bg-panel/60 p-2.5">
                 <label className="mb-3 flex items-center justify-between text-[10px] text-neutral-400">
                   Key color
@@ -435,7 +754,51 @@ const PanelTitle = ({ icon, title }: { icon: React.ReactNode; title: string }) =
 export const MainLayout = () => {
   const projectName = useTimelineStore((state) => state.project.name);
   const setProject = useTimelineStore((state) => state.setProject);
+  const addAsset = useTimelineStore((state) => state.addAsset);
+  const frameRate = useTimelineStore((state) => state.project.settings.frameRate);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  // Paste-to-import: media files on the clipboard become assets (no picker).
+  useEffect(() => {
+    const onPaste = async (event: ClipboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
+      const dropped = event.clipboardData?.files;
+      if (!dropped || dropped.length === 0) return;
+      const files = Array.from(dropped).filter(
+        (file) =>
+          /^(video|audio|image)\//.test(file.type) ||
+          /\.(mp4|mov|m4v|webm|mkv|mp3|wav|aac|flac|ogg|m4a|png|jpe?g|gif|webp|avif)$/i.test(file.name),
+      );
+      if (files.length === 0) return;
+      event.preventDefault();
+      for (const file of files) {
+        try {
+          const handleKey = await fileSystemService.registerBlobFile(file);
+          const kind = classifyMedia(file.type || "", file.name);
+          const probed = await probeMedia(file, kind);
+          addAsset({
+            id: createId<MediaAssetId>(),
+            kind,
+            name: file.name || `Pasted ${kind}`,
+            handleKey,
+            durationFrames: Math.max(1, Math.round(probed.duration * frameRate)),
+            width: probed.width || undefined,
+            height: probed.height || undefined,
+            frameRate: undefined,
+            mimeType: file.type || "application/octet-stream",
+            fileSizeBytes: file.size,
+          });
+          setStatusMessage(`Imported ${file.name || "pasted media"}`);
+          window.setTimeout(() => setStatusMessage(null), 2500);
+        } catch (error) {
+          setStatusMessage(error instanceof Error ? error.message : String(error));
+        }
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [addAsset, frameRate]);
 
   const withStatus = useCallback(async (label: string, action: () => Promise<void>) => {
     try {

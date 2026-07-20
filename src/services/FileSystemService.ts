@@ -109,7 +109,10 @@ const openDatabase = (): Promise<IDBDatabase> =>
     request.onerror = () => reject(request.error ?? new Error("IndexedDB open failed"));
   });
 
-const idbPut = async (key: string, value: FileSystemFileHandle): Promise<void> => {
+/** Stored media reference: either a re-acquirable disk handle or an inline blob. */
+type StoredMediaRef = FileSystemFileHandle | File;
+
+const idbPut = async (key: string, value: StoredMediaRef): Promise<void> => {
   const db = await openDatabase();
   try {
     await new Promise<void>((resolve, reject) => {
@@ -123,13 +126,13 @@ const idbPut = async (key: string, value: FileSystemFileHandle): Promise<void> =
   }
 };
 
-const idbGet = async (key: string): Promise<FileSystemFileHandle | undefined> => {
+const idbGet = async (key: string): Promise<StoredMediaRef | undefined> => {
   const db = await openDatabase();
   try {
     return await new Promise((resolve, reject) => {
       const tx = db.transaction(HANDLE_STORE, "readonly");
       const request = tx.objectStore(HANDLE_STORE).get(key);
-      request.onsuccess = () => resolve(request.result as FileSystemFileHandle | undefined);
+      request.onsuccess = () => resolve(request.result as StoredMediaRef | undefined);
       request.onerror = () => reject(request.error ?? new Error("IndexedDB read failed"));
     });
   } finally {
@@ -150,6 +153,9 @@ export interface ImportedMediaFile {
 export class FileSystemService {
   /** Live handle cache; IndexedDB is the durable layer beneath it. */
   private readonly handleCache = new Map<string, FileSystemFileHandle>();
+
+  /** In-memory cache for inline blobs (pasted/dropped media without a handle). */
+  private readonly blobCache = new Map<string, File>();
 
   /** Handle to the currently open .webcut file, enabling silent re-save. */
   private projectHandle: FileSystemFileHandle | null = null;
@@ -192,11 +198,30 @@ export class FileSystemService {
     return imported;
   }
 
+  /**
+   * Register an inline File (e.g. pasted from the clipboard) that has no disk
+   * handle. The blob is persisted to IndexedDB so it survives reloads/save.
+   */
+  async registerBlobFile(file: File): Promise<string> {
+    const handleKey = `blob:${crypto.randomUUID()}`;
+    this.blobCache.set(handleKey, file);
+    await idbPut(handleKey, file);
+    return handleKey;
+  }
+
   /** Re-acquire a File for a persisted handle key (e.g. after project load). */
   async resolveMediaFile(handleKey: string): Promise<File> {
+    const cachedBlob = this.blobCache.get(handleKey);
+    if (cachedBlob) return cachedBlob;
+
     let handle = this.handleCache.get(handleKey);
     if (!handle) {
-      handle = await idbGet(handleKey);
+      const stored = await idbGet(handleKey);
+      if (stored instanceof File) {
+        this.blobCache.set(handleKey, stored);
+        return stored;
+      }
+      handle = stored;
       if (!handle) {
         throw new Error(`Media handle not found for key "${handleKey}". The file link may have been cleared.`);
       }

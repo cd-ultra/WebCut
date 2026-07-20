@@ -24,6 +24,7 @@ import {
   type Effect,
   type MediaAsset,
   type Project,
+  type ProjectSettings,
   type Track,
   type TrackId,
   type TrackItem,
@@ -121,6 +122,12 @@ const createTransport = (getFps: () => number, getDuration: () => number): Trans
 
 export type EditorTool = "select" | "razor" | "hand";
 
+/** A clipboard entry remembers which track an item came from for paste targeting. */
+interface ClipboardEntry {
+  readonly item: TrackItem;
+  readonly trackId: TrackId;
+}
+
 export interface TimelineState {
   project: Project;
   selectedItemIds: readonly TrackItemId[];
@@ -131,6 +138,11 @@ export interface TimelineState {
   activeTool: EditorTool;
   /** Bumped on every structural edit; renderer uses it as a dirty flag. */
   revision: number;
+  /** In-app clipboard for copy/cut/paste of timeline items. */
+  clipboard: readonly ClipboardEntry[];
+  /** Undo/redo stacks — full project snapshots (structural edits only). */
+  past: readonly Project[];
+  future: readonly Project[];
 
   // -- actions --
   setProject(project: Project): void;
@@ -141,17 +153,30 @@ export interface TimelineState {
   zoomBy(factor: number): void;
   addAsset(asset: MediaAsset): void;
   addClipToTrack(trackId: TrackId, clip: Omit<ClipItem, "id">): TrackItemId;
+  addItemToTrack(trackId: TrackId, item: Omit<TrackItem, "id">): TrackItemId;
   moveItem(itemId: TrackItemId, deltaFrames: number, targetTrackId?: TrackId): void;
   trimItem(itemId: TrackItemId, edge: "start" | "end", newFrame: number): void;
   splitItemAtFrame(itemId: TrackItemId, frame: number): void;
   removeItems(itemIds: readonly TrackItemId[]): void;
+  rippleDelete(itemIds: readonly TrackItemId[]): void;
   setSelection(itemIds: readonly TrackItemId[]): void;
   updateItemEffects(itemId: TrackItemId, effects: readonly Effect[]): void;
+  updateItem(itemId: TrackItemId, updater: (item: TrackItem) => TrackItem, coalesceKey?: string): void;
+  setProjectSettings(patch: Partial<ProjectSettings>): void;
   toggleTrackFlag(trackId: TrackId, flag: "muted" | "soloed" | "locked" | "hidden"): void;
+  // clipboard + history
+  copySelection(): void;
+  cutSelection(): void;
+  duplicateSelection(): void;
+  pasteClipboard(): void;
+  undo(): void;
+  redo(): void;
 }
 
 const MIN_PPF = 0.02;
 const MAX_PPF = 60;
+const HISTORY_LIMIT = 100;
+const COALESCE_MS = 600;
 
 const mapItems = (project: Project, fn: (item: TrackItem, track: Track) => TrackItem): Project => ({
   ...project,
@@ -161,6 +186,43 @@ const mapItems = (project: Project, fn: (item: TrackItem, track: Track) => Track
   })),
 });
 
+// -- Undo/redo history bookkeeping -------------------------------------------
+// Continuous gestures (drags, slider scrubs) would otherwise flood the undo
+// stack with one entry per pointer event. A coalesce key + time window folds a
+// burst into the single pre-burst snapshot.
+let lastCoalesceKey = "";
+let lastCoalesceTime = 0;
+
+type HistoryPatch = Pick<TimelineState, "past" | "future">;
+
+/** Always push the current project as an undo checkpoint (discrete edits). */
+const pushPast = (state: TimelineState): HistoryPatch => {
+  lastCoalesceKey = "";
+  return { past: [...state.past, state.project].slice(-HISTORY_LIMIT), future: [] };
+};
+
+/** Push a checkpoint unless this gesture already pushed one recently. */
+const pushPastCoalesced = (state: TimelineState, key: string): HistoryPatch => {
+  const now = Date.now();
+  if (key === lastCoalesceKey && now - lastCoalesceTime < COALESCE_MS) {
+    lastCoalesceTime = now;
+    return { past: state.past, future: [] };
+  }
+  lastCoalesceKey = key;
+  lastCoalesceTime = now;
+  return { past: [...state.past, state.project].slice(-HISTORY_LIMIT), future: [] };
+};
+
+/**
+ * Resolve the paste target track for an item, preferring its origin track and
+ * falling back to the first video track (overlays and visual clips), then any
+ * unlocked track.
+ */
+const targetTrackFor = (tracks: readonly Track[], originId: TrackId, _item: TrackItem): Track | undefined =>
+  tracks.find((t) => t.id === originId && !t.locked) ??
+  tracks.find((t) => t.kind === "video" && !t.locked) ??
+  tracks.find((t) => !t.locked);
+
 export const useTimelineStore = create<TimelineState>()(
   subscribeWithSelector((set, get) => ({
     project: createEmptyProject(),
@@ -169,8 +231,12 @@ export const useTimelineStore = create<TimelineState>()(
     pixelsPerFrame: 2,
     activeTool: "select",
     revision: 0,
+    clipboard: [],
+    past: [],
+    future: [],
 
-    setProject: (project) => set({ project, selectedItemIds: [], armedTrackId: null, revision: get().revision + 1 }),
+    setProject: (project) =>
+      set({ project, selectedItemIds: [], armedTrackId: null, revision: get().revision + 1, past: [], future: [] }),
 
     armTrack: (trackId) => set({ armedTrackId: trackId }),
 
@@ -198,6 +264,7 @@ export const useTimelineStore = create<TimelineState>()(
           project: { ...state.project, tracks },
           armedTrackId: id,
           revision: state.revision + 1,
+          ...pushPast(state),
         };
       });
       return id;
@@ -216,6 +283,7 @@ export const useTimelineStore = create<TimelineState>()(
       set((state) => ({
         project: { ...state.project, assets: [...state.project.assets, asset] },
         revision: state.revision + 1,
+        ...pushPast(state),
       })),
 
     addClipToTrack: (trackId, clip) => {
@@ -228,6 +296,23 @@ export const useTimelineStore = create<TimelineState>()(
           ),
         },
         revision: state.revision + 1,
+        ...pushPast(state),
+      }));
+      return id;
+    },
+
+    addItemToTrack: (trackId, item) => {
+      const id = createId<TrackItemId>();
+      set((state) => ({
+        project: {
+          ...state.project,
+          tracks: state.project.tracks.map((track) =>
+            track.id === trackId ? { ...track, items: [...track.items, { ...item, id } as TrackItem] } : track,
+          ),
+        },
+        selectedItemIds: [id],
+        revision: state.revision + 1,
+        ...pushPast(state),
       }));
       return id;
     },
@@ -253,6 +338,7 @@ export const useTimelineStore = create<TimelineState>()(
             ),
           },
           revision: state.revision + 1,
+          ...pushPastCoalesced(state, "move"),
         };
       }),
 
@@ -278,6 +364,7 @@ export const useTimelineStore = create<TimelineState>()(
           return { ...item, durationFrames: newDuration };
         }),
         revision: state.revision + 1,
+        ...pushPastCoalesced(state, "trim"),
       })),
 
     splitItemAtFrame: (itemId, frame) =>
@@ -314,6 +401,7 @@ export const useTimelineStore = create<TimelineState>()(
             }),
           },
           revision: state.revision + 1,
+          ...pushPast(state),
         };
       }),
 
@@ -328,7 +416,36 @@ export const useTimelineStore = create<TimelineState>()(
         },
         selectedItemIds: state.selectedItemIds.filter((id) => !itemIds.includes(id)),
         revision: state.revision + 1,
+        ...pushPast(state),
       })),
+
+    rippleDelete: (itemIds) =>
+      set((state) => {
+        const removed = new Set(itemIds);
+        return {
+          project: {
+            ...state.project,
+            tracks: state.project.tracks.map((track) => {
+              const gone = track.items.filter((item) => removed.has(item.id));
+              if (gone.length === 0) return track;
+              const kept = track.items.filter((item) => !removed.has(item.id));
+              // Each surviving item shifts left by the total duration of removed
+              // items that started before it, closing every gap on the track.
+              const shifted = kept.map((item) => {
+                const delta = gone.reduce(
+                  (sum, g) => (g.startFrame < item.startFrame ? sum + g.durationFrames : sum),
+                  0,
+                );
+                return delta > 0 ? { ...item, startFrame: Math.max(0, item.startFrame - delta) } : item;
+              });
+              return { ...track, items: shifted };
+            }),
+          },
+          selectedItemIds: state.selectedItemIds.filter((id) => !removed.has(id)),
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
 
     setSelection: (selectedItemIds) => set({ selectedItemIds }),
 
@@ -336,6 +453,21 @@ export const useTimelineStore = create<TimelineState>()(
       set((state) => ({
         project: mapItems(state.project, (item) => (item.id === itemId ? { ...item, effects } : item)),
         revision: state.revision + 1,
+        ...pushPastCoalesced(state, `effects:${itemId}`),
+      })),
+
+    updateItem: (itemId, updater, coalesceKey) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) => (item.id === itemId ? updater(item) : item)),
+        revision: state.revision + 1,
+        ...(coalesceKey ? pushPastCoalesced(state, `${coalesceKey}:${itemId}`) : pushPast(state)),
+      })),
+
+    setProjectSettings: (patch) =>
+      set((state) => ({
+        project: { ...state.project, settings: { ...state.project.settings, ...patch } },
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, "settings"),
       })),
 
     toggleTrackFlag: (trackId, flag) =>
@@ -347,9 +479,132 @@ export const useTimelineStore = create<TimelineState>()(
           ),
         },
         revision: state.revision + 1,
+        ...pushPast(state),
       })),
+
+    // -- clipboard --------------------------------------------------------------
+
+    copySelection: () =>
+      set((state) => ({ clipboard: collectSelection(state) })),
+
+    cutSelection: () =>
+      set((state) => {
+        const entries = collectSelection(state);
+        if (entries.length === 0) return state;
+        const ids = new Set(entries.map((e) => e.item.id));
+        return {
+          clipboard: entries,
+          project: {
+            ...state.project,
+            tracks: state.project.tracks.map((track) => ({
+              ...track,
+              items: track.items.filter((item) => !ids.has(item.id)),
+            })),
+          },
+          selectedItemIds: [],
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
+
+    duplicateSelection: () =>
+      set((state) => {
+        const entries = collectSelection(state);
+        if (entries.length === 0) return state;
+        const newIds: TrackItemId[] = [];
+        const tracks = state.project.tracks.map((track) => {
+          const dupes = entries
+            .filter((e) => e.trackId === track.id)
+            .map((e) => {
+              const id = createId<TrackItemId>();
+              newIds.push(id);
+              // Place the copy immediately after the original on the same track.
+              return { ...e.item, id, startFrame: e.item.startFrame + e.item.durationFrames } as TrackItem;
+            });
+          return dupes.length > 0 ? { ...track, items: [...track.items, ...dupes] } : track;
+        });
+        return {
+          project: { ...state.project, tracks },
+          selectedItemIds: newIds,
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
+
+    pasteClipboard: () =>
+      set((state) => {
+        const entries = state.clipboard;
+        if (entries.length === 0) return state;
+        const minStart = Math.min(...entries.map((e) => e.item.startFrame));
+        const delta = Math.round(transport.getFrame()) - minStart;
+        const newIds: TrackItemId[] = [];
+        let tracks = state.project.tracks;
+        for (const entry of entries) {
+          const target = targetTrackFor(tracks, entry.trackId, entry.item);
+          if (!target) continue;
+          const id = createId<TrackItemId>();
+          newIds.push(id);
+          const pasted = {
+            ...entry.item,
+            id,
+            startFrame: Math.max(0, entry.item.startFrame + delta),
+          } as TrackItem;
+          tracks = tracks.map((track) =>
+            track.id === target.id ? { ...track, items: [...track.items, pasted] } : track,
+          );
+        }
+        if (newIds.length === 0) return state;
+        return {
+          project: { ...state.project, tracks },
+          selectedItemIds: newIds,
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
+
+    // -- undo / redo ------------------------------------------------------------
+
+    undo: () =>
+      set((state) => {
+        if (state.past.length === 0) return state;
+        lastCoalesceKey = "";
+        const previous = state.past[state.past.length - 1];
+        return {
+          project: previous,
+          past: state.past.slice(0, -1),
+          future: [state.project, ...state.future].slice(0, HISTORY_LIMIT),
+          selectedItemIds: [],
+          revision: state.revision + 1,
+        };
+      }),
+
+    redo: () =>
+      set((state) => {
+        if (state.future.length === 0) return state;
+        lastCoalesceKey = "";
+        const next = state.future[0];
+        return {
+          project: next,
+          past: [...state.past, state.project].slice(-HISTORY_LIMIT),
+          future: state.future.slice(1),
+          selectedItemIds: [],
+          revision: state.revision + 1,
+        };
+      }),
   })),
 );
+
+/** Gather the currently-selected items paired with their owning track id. */
+const collectSelection = (state: TimelineState): ClipboardEntry[] => {
+  const selected = new Set(state.selectedItemIds);
+  const entries: ClipboardEntry[] = [];
+  for (const track of state.project.tracks) {
+    for (const item of track.items) {
+      if (selected.has(item.id)) entries.push({ item, trackId: track.id });
+    }
+  }
+  return entries;
+};
 
 // ---------------------------------------------------------------------------
 // Transport singleton (constructed against live store reads)
