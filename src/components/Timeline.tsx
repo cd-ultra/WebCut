@@ -37,6 +37,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { ASSET_DND_MIME, ingestFiles } from "../services/mediaImport";
+import { getWaveform } from "../services/waveform";
 import {
   transport,
   useTimelineStore,
@@ -116,11 +117,46 @@ const ITEM_COLORS: Record<TrackItem["type"], string> = {
   clip: "bg-[#2d5a9e] border-[#4f8cff]",
   shape: "bg-[#7a4f9e] border-[#b07fe0]",
   text: "bg-[#9e7a2d] border-[#e0b65f]",
+  sticker: "bg-[#2d7a5a] border-[#5fe0b0]",
+};
+
+/** Canvas waveform overlay for audio-bearing clips. */
+const WaveformStrip = ({ asset, width, height }: { asset: MediaAsset; width: number; height: number }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [peaks, setPeaks] = useState<number[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void getWaveform(asset).then((p) => {
+      if (alive) setPeaks(p);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [asset]);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !peaks || width < 2) return;
+    canvas.width = Math.max(1, Math.floor(width));
+    canvas.height = Math.max(1, Math.floor(height));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    const mid = canvas.height / 2;
+    for (let x = 0; x < canvas.width; x++) {
+      const peak = peaks[Math.floor((x / canvas.width) * peaks.length)] ?? 0;
+      const h = Math.max(1, peak * (canvas.height - 2));
+      ctx.fillRect(x, mid - h / 2, 1, h);
+    }
+  }, [peaks, width, height]);
+  if (!peaks) return null;
+  return <canvas ref={canvasRef} className="pointer-events-none absolute inset-x-0 bottom-0" style={{ height }} />;
 };
 
 const ClipBlock = ({
   item,
   track,
+  asset,
   pixelsPerFrame,
   selected,
   onPointerDown,
@@ -128,14 +164,16 @@ const ClipBlock = ({
 }: {
   item: TrackItem;
   track: Track;
+  asset?: MediaAsset;
   pixelsPerFrame: number;
   selected: boolean;
   onPointerDown: (event: ReactPointerEvent, item: TrackItem, mode: DragMode) => void;
   onContextMenu: (event: ReactMouseEvent, item: TrackItem) => void;
 }) => {
+  const width = Math.max(2, item.durationFrames * pixelsPerFrame);
   const style: CSSProperties = {
     left: item.startFrame * pixelsPerFrame,
-    width: Math.max(2, item.durationFrames * pixelsPerFrame),
+    width,
     height: track.heightPx - 8,
   };
 
@@ -149,7 +187,10 @@ const ClipBlock = ({
       } ${item.locked ? "opacity-50" : ""}`}
       style={style}
     >
-      <span className="pointer-events-none block truncate px-1.5 pt-0.5 text-[10px] font-medium text-white/90">
+      {asset && asset.kind !== "image" && (
+        <WaveformStrip asset={asset} width={width} height={Math.max(10, (track.heightPx - 8) * 0.6)} />
+      )}
+      <span className="pointer-events-none relative block truncate px-1.5 pt-0.5 text-[10px] font-medium text-white/90">
         {item.name}
       </span>
       <div
@@ -270,6 +311,8 @@ export const Timeline = () => {
   const zoomBy = useTimelineStore((state) => state.zoomBy);
   const moveItem = useTimelineStore((state) => state.moveItem);
   const trimItem = useTimelineStore((state) => state.trimItem);
+  const trimItemRipple = useTimelineStore((state) => state.trimItemRipple);
+  const assets = useTimelineStore((state) => state.project.assets);
   const splitItemAtFrame = useTimelineStore((state) => state.splitItemAtFrame);
   const setSelection = useTimelineStore((state) => state.setSelection);
   const removeItems = useTimelineStore((state) => state.removeItems);
@@ -285,6 +328,7 @@ export const Timeline = () => {
   const displayFrame = useTransportFrame();
   const [isPlaying, setIsPlaying] = useState(false);
   const [snapping, setSnapping] = useState(true);
+  const [ripple, setRipple] = useState(false);
   const [scrollLeft, setScrollLeft] = useState(0);
   const [menu, setMenu] = useState<{ x: number; y: number; item: TrackItem } | null>(null);
   const [dropTrackId, setDropTrackId] = useState<TrackId | null>(null);
@@ -418,13 +462,11 @@ export const Timeline = () => {
         moveItem(drag.itemId, targetStart - currentItem.startFrame);
       }
     } else if (drag.mode === "trim-start") {
-      trimItem(drag.itemId, "start", maybeSnap(drag.originStartFrame + deltaFrames));
+      const trim = ripple ? trimItemRipple : trimItem;
+      trim(drag.itemId, "start", maybeSnap(drag.originStartFrame + deltaFrames));
     } else {
-      trimItem(
-        drag.itemId,
-        "end",
-        maybeSnap(drag.originStartFrame + drag.originDurationFrames + deltaFrames),
-      );
+      const trim = ripple ? trimItemRipple : trimItem;
+      trim(drag.itemId, "end", maybeSnap(drag.originStartFrame + drag.originDurationFrames + deltaFrames));
     }
   };
 
@@ -620,6 +662,13 @@ export const Timeline = () => {
           <Magnet size={14} />
         </button>
         <button
+          title="Ripple trim — trimming shifts downstream clips"
+          onClick={() => setRipple((r) => !r)}
+          className={`rounded px-1.5 py-1 text-[10px] font-semibold ${ripple ? "bg-accent/25 text-accent" : "text-neutral-400 hover:bg-panel-raised"}`}
+        >
+          RIP
+        </button>
+        <button
           title="Add marker at playhead (M)"
           onClick={() => addMarker(transport.getFrame())}
           className="rounded p-1.5 text-neutral-400 hover:bg-panel-raised"
@@ -770,6 +819,7 @@ export const Timeline = () => {
                       key={item.id}
                       item={item}
                       track={track}
+                      asset={item.type === "clip" ? assets.find((a) => a.id === item.assetId) : undefined}
                       pixelsPerFrame={pixelsPerFrame}
                       selected={selectedItemIds.includes(item.id)}
                       onPointerDown={onClipPointerDown}

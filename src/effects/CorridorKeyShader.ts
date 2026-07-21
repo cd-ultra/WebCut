@@ -17,7 +17,7 @@
  * `useNeuralMatte` simply gates the blend in the shader.
  */
 
-import type { CorridorKeyParams } from "../types/timeline";
+import type { BlendMode, CorridorKeyParams } from "../types/timeline";
 
 // ---------------------------------------------------------------------------
 // WGSL
@@ -223,6 +223,8 @@ export const packCorridorKeyUniforms = (
 
 export interface CorridorKeyPassResources {
   readonly pipeline: GPURenderPipeline;
+  /** One pipeline per blend mode (all share the shader + bind group layout). */
+  readonly pipelines: Record<BlendMode, GPURenderPipeline>;
   readonly uniformBuffer: GPUBuffer;
   readonly sampler: GPUSampler;
   readonly bindGroupLayout: GPUBindGroupLayout;
@@ -230,6 +232,26 @@ export interface CorridorKeyPassResources {
   readonly fallbackMatteTexture: GPUTexture;
   destroy(): void;
 }
+
+/** Blend state per mode. Alpha is kept as premultiplied "over" so coverage is stable. */
+const BLEND_STATES: Record<BlendMode, GPUBlendState> = {
+  normal: {
+    color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+    alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+  },
+  multiply: {
+    color: { srcFactor: "dst", dstFactor: "zero", operation: "add" },
+    alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+  },
+  screen: {
+    color: { srcFactor: "one-minus-dst", dstFactor: "one", operation: "add" },
+    alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+  },
+  add: {
+    color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+    alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+  },
+};
 
 export const createCorridorKeyPass = (
   device: GPUDevice,
@@ -250,31 +272,43 @@ export const createCorridorKeyPass = (
     ],
   });
 
-  const pipeline = device.createRenderPipeline({
-    label: "corridor-key-pipeline",
-    layout: device.createPipelineLayout({
-      bindGroupLayouts: [
-        // group 0 reserved for compositor globals; effects own group 1.
-        device.createBindGroupLayout({ entries: [] }),
-        bindGroupLayout,
-      ],
-    }),
-    vertex: { module, entryPoint: "vs_fullscreen" },
-    fragment: {
-      module,
-      entryPoint: "fs_corridor_key",
-      targets: [
-        {
-          format: targetFormat,
-          blend: {
-            color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-          },
-        },
-      ],
-    },
-    primitive: { topology: "triangle-list" },
+  const pipelineLayout = device.createPipelineLayout({
+    bindGroupLayouts: [
+      // group 0 reserved for compositor globals; effects own group 1.
+      device.createBindGroupLayout({ entries: [] }),
+      bindGroupLayout,
+    ],
   });
+
+  const buildPipeline = (mode: BlendMode): GPURenderPipeline =>
+    device.createRenderPipeline({
+      label: `corridor-key-pipeline-${mode}`,
+      layout: pipelineLayout,
+      vertex: { module, entryPoint: "vs_fullscreen" },
+      fragment: {
+        module,
+        entryPoint: "fs_corridor_key",
+        targets: [{ format: targetFormat, blend: BLEND_STATES[mode] }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+  const pipeline = buildPipeline("normal");
+  // Build blend-mode variants defensively: a rejected blend combo must not take
+  // down the whole compositor — fall back to the normal pipeline instead.
+  const pipelines: Record<BlendMode, GPURenderPipeline> = {
+    normal: pipeline,
+    multiply: pipeline,
+    screen: pipeline,
+    add: pipeline,
+  };
+  for (const mode of ["multiply", "screen", "add"] as const) {
+    try {
+      pipelines[mode] = buildPipeline(mode);
+    } catch (error) {
+      console.warn(`[WebCut] blend mode "${mode}" unavailable, using normal:`, error);
+    }
+  }
 
   const uniformBuffer = device.createBuffer({
     label: "corridor-key-uniforms",
@@ -305,6 +339,7 @@ export const createCorridorKeyPass = (
 
   return {
     pipeline,
+    pipelines,
     uniformBuffer,
     sampler,
     bindGroupLayout,

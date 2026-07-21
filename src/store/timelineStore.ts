@@ -21,17 +21,25 @@ import {
   createEmptyProject,
   createId,
   MARKER_COLORS,
+  sampleAnimatable,
+  type AnimatableValue,
   type ClipItem,
   type Effect,
+  type Keyframe,
+  type KeyframeId,
   type Marker,
   type MarkerId,
   type MediaAsset,
   type Project,
   type ProjectSettings,
+  type Subtitle,
+  type SubtitleId,
+  type SubtitleStyle,
   type Track,
   type TrackId,
   type TrackItem,
   type TrackItemId,
+  type Transform,
 } from "../types/timeline";
 import { useEffect, useRef, useState } from "react";
 
@@ -125,6 +133,9 @@ const createTransport = (getFps: () => number, getDuration: () => number): Trans
 
 export type EditorTool = "select" | "razor" | "hand";
 
+/** Transform properties that can be keyframed. */
+export type TransformProp = "position" | "scale" | "rotation" | "opacity";
+
 /** A clipboard entry remembers which track an item came from for paste targeting. */
 interface ClipboardEntry {
   readonly item: TrackItem;
@@ -170,6 +181,24 @@ export interface TimelineState {
   updateMarker(markerId: MarkerId, patch: Partial<Pick<Marker, "label" | "color" | "frame">>): void;
   removeMarker(markerId: MarkerId): void;
   toggleTrackFlag(trackId: TrackId, flag: "muted" | "soloed" | "locked" | "hidden"): void;
+  // subtitles
+  addSubtitle(startFrame: number, endFrame: number, text: string): void;
+  updateSubtitle(id: SubtitleId, patch: Partial<Pick<Subtitle, "startFrame" | "endFrame" | "text">>): void;
+  removeSubtitle(id: SubtitleId): void;
+  setSubtitles(subtitles: readonly Subtitle[]): void;
+  setSubtitleStyle(patch: Partial<SubtitleStyle>): void;
+  // keyframes (transform properties)
+  addTransformKeyframe(itemId: TrackItemId, prop: TransformProp, localFrame: number): void;
+  removeTransformKeyframe(itemId: TrackItemId, prop: TransformProp, keyframeId: KeyframeId): void;
+  updateTransformKeyframe(
+    itemId: TrackItemId,
+    prop: TransformProp,
+    keyframeId: KeyframeId,
+    patch: Partial<Pick<Keyframe<number>, "interpolation" | "bezier">>,
+  ): void;
+  clearTransformKeyframes(itemId: TrackItemId, prop: TransformProp, localFrame: number): void;
+  // ripple trim
+  trimItemRipple(itemId: TrackItemId, edge: "start" | "end", newFrame: number): void;
   // clipboard + history
   copySelection(): void;
   cutSelection(): void;
@@ -191,6 +220,41 @@ const mapItems = (project: Project, fn: (item: TrackItem, track: Track) => Track
     items: track.items.map((item) => fn(item, track)),
   })),
 });
+
+// -- Keyframe helpers --------------------------------------------------------
+// Transform values are Vec2 (position/scale) or number (rotation/opacity). The
+// keyframe shape is identical at runtime, so these operate on a number-typed
+// view and callers cast; the stored values pass through verbatim.
+type NumAnimatable = AnimatableValue<number>;
+
+const insertKeyframe = (av: NumAnimatable, frame: number): NumAnimatable => {
+  const whole = Math.max(0, Math.round(frame));
+  const value = sampleAnimatable(av, whole);
+  const kf: Keyframe<number> = { id: createId<KeyframeId>(), frame: whole, value, interpolation: "linear" };
+  const existing = av.kind === "animated" ? av.keyframes.filter((k) => k.frame !== whole) : [];
+  return { kind: "animated", keyframes: [...existing, kf].sort((a, b) => a.frame - b.frame) };
+};
+
+const dropKeyframe = (av: NumAnimatable, keyframeId: KeyframeId): NumAnimatable => {
+  if (av.kind !== "animated") return av;
+  const keyframes = av.keyframes.filter((k) => k.id !== keyframeId);
+  if (keyframes.length <= 1) {
+    return { kind: "static", value: keyframes[0]?.value ?? av.keyframes[0].value };
+  }
+  return { kind: "animated", keyframes };
+};
+
+const patchKeyframe = (
+  av: NumAnimatable,
+  keyframeId: KeyframeId,
+  patch: Partial<Pick<Keyframe<number>, "interpolation" | "bezier">>,
+): NumAnimatable => {
+  if (av.kind !== "animated") return av;
+  return { kind: "animated", keyframes: av.keyframes.map((k) => (k.id === keyframeId ? { ...k, ...patch } : k)) };
+};
+
+/** Cast a transform property (Vec2 or number animatable) to the number-typed view. */
+const asNum = (av: Transform["position"] | Transform["rotation"]): NumAnimatable => av as unknown as NumAnimatable;
 
 // -- Undo/redo history bookkeeping -------------------------------------------
 // Continuous gestures (drags, slider scrubs) would otherwise flood the undo
@@ -514,6 +578,168 @@ export const useTimelineStore = create<TimelineState>()(
         revision: state.revision + 1,
         ...pushPast(state),
       })),
+
+    // -- subtitles --------------------------------------------------------------
+
+    addSubtitle: (startFrame, endFrame, text) =>
+      set((state) => {
+        const subtitle: Subtitle = {
+          id: createId<SubtitleId>(),
+          startFrame: Math.max(0, Math.round(startFrame)),
+          endFrame: Math.max(Math.round(startFrame) + 1, Math.round(endFrame)),
+          text,
+        };
+        return {
+          project: {
+            ...state.project,
+            subtitles: [...state.project.subtitles, subtitle].sort((a, b) => a.startFrame - b.startFrame),
+          },
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
+
+    updateSubtitle: (id, patch) =>
+      set((state) => ({
+        project: {
+          ...state.project,
+          subtitles: state.project.subtitles
+            .map((s) => (s.id === id ? { ...s, ...patch } : s))
+            .sort((a, b) => a.startFrame - b.startFrame),
+        },
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, `subtitle:${id}`),
+      })),
+
+    removeSubtitle: (id) =>
+      set((state) => ({
+        project: { ...state.project, subtitles: state.project.subtitles.filter((s) => s.id !== id) },
+        revision: state.revision + 1,
+        ...pushPast(state),
+      })),
+
+    setSubtitles: (subtitles) =>
+      set((state) => ({
+        project: { ...state.project, subtitles: [...subtitles].sort((a, b) => a.startFrame - b.startFrame) },
+        revision: state.revision + 1,
+        ...pushPast(state),
+      })),
+
+    setSubtitleStyle: (patch) =>
+      set((state) => ({
+        project: { ...state.project, subtitleStyle: { ...state.project.subtitleStyle, ...patch } },
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, "subtitleStyle"),
+      })),
+
+    // -- keyframes --------------------------------------------------------------
+
+    addTransformKeyframe: (itemId, prop, localFrame) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) =>
+          item.id === itemId
+            ? {
+                ...item,
+                transform: {
+                  ...item.transform,
+                  [prop]: insertKeyframe(asNum(item.transform[prop]), localFrame),
+                } as Transform,
+              }
+            : item,
+        ),
+        revision: state.revision + 1,
+        ...pushPast(state),
+      })),
+
+    removeTransformKeyframe: (itemId, prop, keyframeId) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) =>
+          item.id === itemId
+            ? {
+                ...item,
+                transform: {
+                  ...item.transform,
+                  [prop]: dropKeyframe(asNum(item.transform[prop]), keyframeId),
+                } as Transform,
+              }
+            : item,
+        ),
+        revision: state.revision + 1,
+        ...pushPast(state),
+      })),
+
+    updateTransformKeyframe: (itemId, prop, keyframeId, patch) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) =>
+          item.id === itemId
+            ? {
+                ...item,
+                transform: {
+                  ...item.transform,
+                  [prop]: patchKeyframe(asNum(item.transform[prop]), keyframeId, patch),
+                } as Transform,
+              }
+            : item,
+        ),
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, `kf:${itemId}:${prop}`),
+      })),
+
+    clearTransformKeyframes: (itemId, prop, localFrame) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) =>
+          item.id === itemId
+            ? {
+                ...item,
+                transform: {
+                  ...item.transform,
+                  [prop]: { kind: "static", value: sampleAnimatable(asNum(item.transform[prop]), localFrame) },
+                } as Transform,
+              }
+            : item,
+        ),
+        revision: state.revision + 1,
+        ...pushPast(state),
+      })),
+
+    // -- ripple trim ------------------------------------------------------------
+
+    trimItemRipple: (itemId, edge, newFrame) =>
+      set((state) => {
+        const project = {
+          ...state.project,
+          tracks: state.project.tracks.map((track) => {
+            const target = track.items.find((i) => i.id === itemId);
+            if (!target) return track;
+            const oldEnd = target.startFrame + target.durationFrames;
+            let shift = 0;
+            const items = track.items.map((item) => {
+              if (item.id !== itemId) return item;
+              if (edge === "end") {
+                const newDuration = Math.max(1, Math.round(newFrame) - item.startFrame);
+                shift = newDuration - item.durationFrames;
+                return { ...item, durationFrames: newDuration };
+              }
+              const maxStart = item.startFrame + item.durationFrames - 1;
+              const clampedStart = Math.max(0, Math.min(Math.round(newFrame), maxStart));
+              const consumed = clampedStart - item.startFrame;
+              shift = -consumed;
+              const next = { ...item, startFrame: clampedStart, durationFrames: item.durationFrames - consumed };
+              return next.type === "clip"
+                ? { ...next, sourceInFrame: Math.max(0, next.sourceInFrame + consumed) }
+                : next;
+            });
+            // Shift downstream items (those starting at/after the old end) by the delta.
+            const shifted = items.map((item) =>
+              item.id !== itemId && item.startFrame >= oldEnd
+                ? { ...item, startFrame: Math.max(0, item.startFrame + shift) }
+                : item,
+            );
+            return { ...track, items: shifted };
+          }),
+        };
+        return { project, revision: state.revision + 1, ...pushPastCoalesced(state, "trim") };
+      }),
 
     toggleTrackFlag: (trackId, flag) =>
       set((state) => ({
