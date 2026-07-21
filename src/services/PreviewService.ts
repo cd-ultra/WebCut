@@ -55,6 +55,8 @@ type RVFCVideo = HTMLVideoElement & {
   cancelVideoFrameCallback?: (handle: number) => void;
 };
 
+const EMPTY_VIDEO_SET: ReadonlySet<RVFCVideo> = new Set();
+
 interface ActiveLayerClip {
   readonly clip: ClipItem;
   readonly asset: MediaAsset;
@@ -139,11 +141,17 @@ class PreviewService {
   private rvfcLoops = new Map<RVFCVideo, { handle: number; layerId: string; order: number }>();
   private unsubscribeTransport: (() => void) | null = null;
   private unsubscribeStore: (() => void) | null = null;
-  private pendingSync = false;
+  private syncing = false;
+  private dirty = false;
 
   registerSink(sink: FrameSink): () => void {
     this.sink = sink;
-    this.unsubscribeTransport = transport.subscribe(() => this.scheduleSync());
+    this.unsubscribeTransport = transport.subscribe(() => {
+      // Pausing/scrubbing must silence media immediately — don't wait for the
+      // async sync (which may be mid-decode). This is the authoritative stop.
+      if (!transport.isPlaying()) this.pauseAllExcept(EMPTY_VIDEO_SET);
+      this.scheduleSync();
+    });
     this.unsubscribeStore = useTimelineStore.subscribe(
       (state) => state.revision,
       () => this.scheduleSync(),
@@ -153,18 +161,32 @@ class PreviewService {
       this.unsubscribeTransport?.();
       this.unsubscribeStore?.();
       this.stopAllRvfcLoops();
+      this.pauseAllExcept(EMPTY_VIDEO_SET);
       this.sink = null;
     };
   }
 
-  /** Coalesce bursts of transport notifications into one sync per microtask. */
+  /**
+   * Run syncs strictly sequentially. Overlapping async syncs would each issue
+   * play()/seek on the same elements, doubling audio; a trailing `dirty` pass
+   * guarantees the final state (e.g. a pause) is always applied.
+   */
   private scheduleSync(): void {
-    if (this.pendingSync) return;
-    this.pendingSync = true;
-    queueMicrotask(() => {
-      this.pendingSync = false;
-      void this.sync();
-    });
+    this.dirty = true;
+    if (this.syncing) return;
+    void this.runSyncLoop();
+  }
+
+  private async runSyncLoop(): Promise<void> {
+    this.syncing = true;
+    try {
+      while (this.dirty) {
+        this.dirty = false;
+        await this.sync();
+      }
+    } finally {
+      this.syncing = false;
+    }
   }
 
   private async sync(): Promise<void> {
@@ -228,7 +250,6 @@ class PreviewService {
       return;
     }
 
-    const playing = transport.isPlaying();
     const keepVideos = new Set<RVFCVideo>();
 
     for (const { clip, asset, trackId, trackMuted, order } of actives) {
@@ -256,7 +277,9 @@ class PreviewService {
       const mediaTimeS = (clip.sourceInFrame + localFrame * clip.speed) / fps;
       const clampedTimeS = Math.min(Math.max(0, mediaTimeS), Math.max(0, video.duration - 1 / fps));
 
-      if (playing && clip.speed > 0) {
+      // Read the transport fresh here (not once at the top): a pause during an
+      // earlier `await` in this sync must not leave the video playing.
+      if (transport.isPlaying() && clip.speed > 0) {
         video.playbackRate = Math.min(16, clip.speed);
         if (Math.abs(video.currentTime - clampedTimeS) > DRIFT_TOLERANCE_S) {
           video.currentTime = clampedTimeS;
