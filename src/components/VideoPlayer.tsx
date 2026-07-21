@@ -34,6 +34,7 @@ import {
   defaultCorridorKeyParams,
   sampleAnimatable,
   staticValue,
+  type BlendMode,
   type CorridorKeyParams,
   type TrackItem,
   type TrackItemId,
@@ -107,11 +108,18 @@ class WebGPUCompositor {
         enabled: false,
         order,
         hasFrame: false,
+        blendMode: "normal",
       };
       this.layers.set(layerId, layer);
     }
     layer.order = order;
     return layer;
+  }
+
+  setLayerBlend(layerId: string, mode: BlendMode): void {
+    if (this.destroyed) return;
+    const layer = this.ensureLayer(layerId, this.layers.get(layerId)?.order ?? 0);
+    layer.blendMode = mode;
   }
 
   /** Drop layers whose tracks no longer have a clip under the playhead. */
@@ -215,9 +223,10 @@ class WebGPUCompositor {
     });
 
     if (drawable.length > 0) {
-      pass.setPipeline(this.keyPass.pipeline);
       pass.setBindGroup(0, this.emptyBindGroup);
       for (const layer of drawable) {
+        // Per-layer blend mode selects the matching pipeline variant.
+        pass.setPipeline(this.keyPass.pipelines[layer.blendMode]);
         const bindGroup = this.device.createBindGroup({
           label: "layer-bind-group",
           layout: this.keyPass.bindGroupLayout,
@@ -234,7 +243,7 @@ class WebGPUCompositor {
           ],
         });
         pass.setBindGroup(1, bindGroup);
-        pass.draw(3); // fullscreen triangle, premultiplied "over" blend
+        pass.draw(3); // fullscreen triangle
       }
     }
 
@@ -263,6 +272,7 @@ interface LayerState {
   enabled: boolean;
   order: number;
   hasFrame: boolean;
+  blendMode: BlendMode;
 }
 
 // ---------------------------------------------------------------------------

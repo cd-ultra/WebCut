@@ -19,18 +19,21 @@ import {
   defaultCorridorKeyParams,
   isOverlayItem,
   sampleAnimatable,
+  type BlendMode,
   type ClipItem,
   type CorridorKeyParams,
+  type GradientFill,
   type MediaAsset,
   type MediaAssetId,
+  type OverlayItem,
   type Project,
   type ProjectSettings,
   type ShapeItem,
+  type StickerItem,
+  type SubtitleStyle,
   type TextItem,
   type Vec2,
 } from "../types/timeline";
-
-type OverlayItem = TextItem | ShapeItem;
 
 interface SampledTransform {
   readonly pos: Vec2;
@@ -42,6 +45,7 @@ interface SampledTransform {
 export interface FrameSink {
   ingestLayerFrame(layerId: string, frame: VideoFrame | HTMLVideoElement | ImageBitmap, order: number): void;
   setLayerEffect(layerId: string, enabled: boolean, params: CorridorKeyParams): void;
+  setLayerBlend(layerId: string, mode: BlendMode): void;
   /** Reconcile live layers; anything absent from the list is destroyed. */
   syncLayers(activeLayerIds: readonly string[]): void;
 }
@@ -173,17 +177,49 @@ class PreviewService {
     const actives = resolveActiveClips(project, frame);
     const overlays = resolveActiveOverlays(project, frame);
 
-    sink.syncLayers([...actives.map((layer) => layer.trackId), ...overlays.map((o) => o.layerId)]);
+    const wholeFrame = Math.floor(frame);
+    const bgGradient = project.settings.backgroundGradient;
+    const activeSubtitle = project.subtitles.find((s) => wholeFrame >= s.startFrame && wholeFrame < s.endFrame);
 
-    // Overlays (text/shape): rasterize to a premultiplied bitmap and ingest as
-    // an alpha layer. The compositor's disabled-key path forwards source alpha,
-    // so transparent regions composite correctly over lower layers.
-    const activeOverlayIds = new Set(overlays.map((o) => o.layerId));
+    const BG_ID = "__bg";
+    const SUB_ID = "__subtitle";
+    const layerIds = [...actives.map((layer) => layer.trackId), ...overlays.map((o) => o.layerId)];
+    if (bgGradient) layerIds.push(BG_ID);
+    if (activeSubtitle) layerIds.push(SUB_ID);
+    sink.syncLayers(layerIds);
+
+    // Injected background-gradient layer (drawn beneath everything).
+    if (bgGradient) {
+      sink.setLayerEffect(BG_ID, false, defaultCorridorKeyParams());
+      const sig = `bg|${project.settings.width}x${project.settings.height}|${JSON.stringify(bgGradient)}`;
+      const bmp = await this.cachedRaster(BG_ID, sig, project.settings, (ctx, w, h) => {
+        ctx.fillStyle = backgroundGradientStyle(ctx, bgGradient, w, h);
+        ctx.fillRect(0, 0, w, h);
+      });
+      if (bmp) sink.ingestLayerFrame(BG_ID, bmp, -1);
+    }
+
+    // Overlays (text/shape/sticker): rasterize to a premultiplied bitmap and
+    // ingest as an alpha layer. The compositor's disabled-key path forwards
+    // source alpha, so transparent regions composite correctly.
+    const activeOverlayIds = new Set(layerIds);
     this.pruneOverlayCache(activeOverlayIds);
     for (const { item, layerId, order } of overlays) {
       sink.setLayerEffect(layerId, false, defaultCorridorKeyParams());
+      sink.setLayerBlend(layerId, item.blendMode ?? "normal");
       const bitmap = await this.getOverlayBitmap(item, project.settings, frame);
       if (bitmap) sink.ingestLayerFrame(layerId, bitmap, order);
+    }
+
+    // Injected subtitle layer (drawn above everything).
+    if (activeSubtitle) {
+      sink.setLayerEffect(SUB_ID, false, defaultCorridorKeyParams());
+      const style = project.subtitleStyle;
+      const sig = `sub|${project.settings.width}x${project.settings.height}|${activeSubtitle.text}|${JSON.stringify(style)}`;
+      const bmp = await this.cachedRaster(SUB_ID, sig, project.settings, (ctx, w, h) =>
+        drawSubtitle(ctx, w, h, activeSubtitle.text, style),
+      );
+      if (bmp) sink.ingestLayerFrame(SUB_ID, bmp, 1_000_000);
     }
 
     if (actives.length === 0) {
@@ -198,6 +234,7 @@ class PreviewService {
     for (const { clip, asset, trackId, trackMuted, order } of actives) {
       const key = corridorKeyOf(clip);
       sink.setLayerEffect(trackId, key.enabled, key.params);
+      sink.setLayerBlend(trackId, clip.blendMode ?? "normal");
 
       if (asset.kind === "image") {
         const bitmap = await this.getImageBitmap(asset);
@@ -399,10 +436,38 @@ class PreviewService {
     ctx.rotate((t.rotation * Math.PI) / 180);
     ctx.scale(t.scale.x, t.scale.y);
     if (item.type === "text") drawTextItem(ctx, item);
-    else drawShapeItem(ctx, item, w, h);
+    else if (item.type === "shape") drawShapeItem(ctx, item, w, h);
+    else drawStickerItem(ctx, item);
     ctx.restore();
     // Premultiply so the compositor's premultiplied "over" blend is correct.
     return createImageBitmap(canvas, { premultiplyAlpha: "premultiply" });
+  }
+
+  /** Rasterize a full-canvas layer (background / subtitle) with signature caching. */
+  private async cachedRaster(
+    key: string,
+    sig: string,
+    settings: ProjectSettings,
+    draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void,
+  ): Promise<ImageBitmap | null> {
+    const cached = this.overlayCache.get(key);
+    if (cached && cached.sig === sig) return cached.bitmap;
+    try {
+      const canvas = this.overlayCanvas ?? (this.overlayCanvas = document.createElement("canvas"));
+      canvas.width = settings.width;
+      canvas.height = settings.height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return cached?.bitmap ?? null;
+      ctx.clearRect(0, 0, settings.width, settings.height);
+      draw(ctx, settings.width, settings.height);
+      const bitmap = await createImageBitmap(canvas, { premultiplyAlpha: "premultiply" });
+      cached?.bitmap.close();
+      this.overlayCache.set(key, { sig, bitmap });
+      return bitmap;
+    } catch (error) {
+      console.error("[WebCut] layer render failed:", error);
+      return cached?.bitmap ?? null;
+    }
   }
 
   private pruneOverlayCache(active: ReadonlySet<string>): void {
@@ -433,21 +498,43 @@ class PreviewService {
 
 // -- overlay drawing (module-level, pure) ------------------------------------
 
+const STICKER_BASE_PX = 220;
+
 const overlaySignature = (item: OverlayItem, settings: ProjectSettings, t: SampledTransform): string => {
   const base = `${settings.width}x${settings.height}|${t.pos.x},${t.pos.y}|${t.scale.x},${t.scale.y}|${t.rotation}|${t.opacity}`;
   if (item.type === "text") {
-    return `text|${base}|${item.text}|${item.fontFamily}|${item.fontSizePx}|${item.fontWeight}|${item.fillColor}|${item.alignment}|${item.lineHeight}`;
+    return `text|${base}|${item.text}|${item.fontFamily}|${item.fontSizePx}|${item.fontWeight}|${item.fillColor}|${item.alignment}|${item.lineHeight}|${JSON.stringify(item.fillGradient ?? null)}`;
   }
-  return `shape|${base}|${item.shape}|${item.fillColor}|${item.strokeColor}|${item.strokeWidthPx}|${item.cornerRadiusPx}`;
+  if (item.type === "sticker") {
+    return `sticker|${base}|${item.content}`;
+  }
+  return `shape|${base}|${item.shape}|${item.fillColor}|${item.strokeColor}|${item.strokeWidthPx}|${item.cornerRadiusPx}|${JSON.stringify(item.fillGradient ?? null)}`;
+};
+
+/** Build a CanvasGradient in local coordinates (centered at origin), sized to `extent`. */
+const gradientStyle = (ctx: CanvasRenderingContext2D, gradient: GradientFill, extent: number): CanvasGradient => {
+  let grad: CanvasGradient;
+  if (gradient.kind === "radial") {
+    grad = ctx.createRadialGradient(0, 0, 0, 0, 0, extent / 2);
+  } else {
+    const rad = (gradient.angle * Math.PI) / 180;
+    const dx = (Math.cos(rad) * extent) / 2;
+    const dy = (Math.sin(rad) * extent) / 2;
+    grad = ctx.createLinearGradient(-dx, -dy, dx, dy);
+  }
+  for (const stop of gradient.stops) grad.addColorStop(Math.min(1, Math.max(0, stop.at)), stop.color);
+  return grad;
 };
 
 const drawTextItem = (ctx: CanvasRenderingContext2D, item: TextItem): void => {
-  ctx.fillStyle = item.fillColor;
+  const lines = item.text.split("\n");
+  const lineHeight = item.fontSizePx * item.lineHeight;
+  ctx.fillStyle = item.fillGradient
+    ? gradientStyle(ctx, item.fillGradient, item.fontSizePx * Math.max(2, lines.length))
+    : item.fillColor;
   ctx.textAlign = item.alignment;
   ctx.textBaseline = "middle";
   ctx.font = `${item.fontWeight} ${item.fontSizePx}px ${item.fontFamily}`;
-  const lines = item.text.split("\n");
-  const lineHeight = item.fontSizePx * item.lineHeight;
   let y = -((lines.length - 1) * lineHeight) / 2;
   for (const line of lines) {
     ctx.fillText(line, 0, y);
@@ -455,11 +542,71 @@ const drawTextItem = (ctx: CanvasRenderingContext2D, item: TextItem): void => {
   }
 };
 
+/** Full-canvas gradient (not centered), for the project background layer. */
+const backgroundGradientStyle = (
+  ctx: CanvasRenderingContext2D,
+  gradient: GradientFill,
+  w: number,
+  h: number,
+): CanvasGradient => {
+  let grad: CanvasGradient;
+  if (gradient.kind === "radial") {
+    grad = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.max(w, h) / 2);
+  } else {
+    const rad = (gradient.angle * Math.PI) / 180;
+    const dx = (Math.cos(rad) * w) / 2;
+    const dy = (Math.sin(rad) * h) / 2;
+    grad = ctx.createLinearGradient(w / 2 - dx, h / 2 - dy, w / 2 + dx, h / 2 + dy);
+  }
+  for (const stop of gradient.stops) grad.addColorStop(Math.min(1, Math.max(0, stop.at)), stop.color);
+  return grad;
+};
+
+const drawSubtitle = (
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  text: string,
+  style: SubtitleStyle,
+): void => {
+  const lines = text.split("\n");
+  const lineHeight = style.fontSizePx * 1.25;
+  ctx.font = `600 ${style.fontSizePx}px ${style.fontFamily}`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const baseY = h * style.positionY - ((lines.length - 1) * lineHeight) / 2;
+  const padX = style.fontSizePx * 0.4;
+  const padY = style.fontSizePx * 0.2;
+  lines.forEach((line, i) => {
+    const y = baseY + i * lineHeight;
+    const metrics = ctx.measureText(line);
+    const boxW = metrics.width + padX * 2;
+    const boxH = lineHeight + padY;
+    ctx.fillStyle = style.backgroundColor;
+    if (typeof ctx.roundRect === "function") {
+      ctx.beginPath();
+      ctx.roundRect(w / 2 - boxW / 2, y - boxH / 2, boxW, boxH, 8);
+      ctx.fill();
+    } else {
+      ctx.fillRect(w / 2 - boxW / 2, y - boxH / 2, boxW, boxH);
+    }
+    ctx.fillStyle = style.fillColor;
+    ctx.fillText(line, w / 2, y);
+  });
+};
+
+const drawStickerItem = (ctx: CanvasRenderingContext2D, item: StickerItem): void => {
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = `${STICKER_BASE_PX}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", system-ui, sans-serif`;
+  ctx.fillText(item.content, 0, 0);
+};
+
 const drawShapeItem = (ctx: CanvasRenderingContext2D, item: ShapeItem, w: number, h: number): void => {
   // Shapes carry no explicit size — a base extent (40% of the short side) is
   // scaled by the item's transform for sizing.
   const base = Math.min(w, h) * 0.4;
-  ctx.fillStyle = item.fillColor;
+  ctx.fillStyle = item.fillGradient ? gradientStyle(ctx, item.fillGradient, base) : item.fillColor;
   ctx.strokeStyle = item.strokeColor;
   ctx.lineWidth = item.strokeWidthPx;
   if (item.shape === "rectangle") {

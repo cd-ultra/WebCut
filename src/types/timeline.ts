@@ -163,6 +163,37 @@ export interface MediaAsset {
 }
 
 // ---------------------------------------------------------------------------
+// Gradients & blend modes
+// ---------------------------------------------------------------------------
+
+export interface GradientStop {
+  /** Position along the gradient, 0..1. */
+  readonly at: number;
+  readonly color: string;
+}
+
+export interface GradientFill {
+  readonly kind: "linear" | "radial";
+  /** Angle in degrees for linear gradients. */
+  readonly angle: number;
+  readonly stops: readonly GradientStop[];
+}
+
+export const GRADIENT_PRESETS: readonly { readonly label: string; readonly fill: GradientFill }[] = [
+  { label: "Sunset", fill: { kind: "linear", angle: 90, stops: [{ at: 0, color: "#ff8f5e" }, { at: 1, color: "#c840a0" }] } },
+  { label: "Ocean", fill: { kind: "linear", angle: 90, stops: [{ at: 0, color: "#2e78ff" }, { at: 1, color: "#33d0c0" }] } },
+  { label: "Grape", fill: { kind: "linear", angle: 135, stops: [{ at: 0, color: "#7a4fe0" }, { at: 1, color: "#e04f9e" }] } },
+  { label: "Mint", fill: { kind: "linear", angle: 90, stops: [{ at: 0, color: "#1fce8f" }, { at: 1, color: "#0f8f6f" }] } },
+  { label: "Ember", fill: { kind: "radial", angle: 0, stops: [{ at: 0, color: "#ffd15e" }, { at: 1, color: "#e0451f" }] } },
+  { label: "Slate", fill: { kind: "linear", angle: 90, stops: [{ at: 0, color: "#3a4152" }, { at: 1, color: "#12151c" }] } },
+];
+
+/** Per-item compositing blend mode. "normal" is the default premultiplied over. */
+export type BlendMode = "normal" | "multiply" | "screen" | "add";
+
+export const BLEND_MODES: readonly BlendMode[] = ["normal", "multiply", "screen", "add"];
+
+// ---------------------------------------------------------------------------
 // Track items
 // ---------------------------------------------------------------------------
 
@@ -176,6 +207,8 @@ interface TrackItemBase {
   readonly transform: Transform;
   readonly effects: readonly Effect[];
   readonly locked: boolean;
+  /** Compositing blend mode; absent ⇒ "normal". */
+  readonly blendMode?: BlendMode;
 }
 
 export interface ClipItem extends TrackItemBase {
@@ -193,6 +226,8 @@ export interface ShapeItem extends TrackItemBase {
   readonly type: "shape";
   readonly shape: "rectangle" | "ellipse" | "line";
   readonly fillColor: string;
+  /** When present, overrides fillColor with a gradient. */
+  readonly fillGradient?: GradientFill;
   readonly strokeColor: string;
   readonly strokeWidthPx: number;
   readonly cornerRadiusPx: number;
@@ -205,15 +240,23 @@ export interface TextItem extends TrackItemBase {
   readonly fontSizePx: number;
   readonly fontWeight: number;
   readonly fillColor: string;
+  readonly fillGradient?: GradientFill;
   readonly alignment: "left" | "center" | "right";
   readonly lineHeight: number;
 }
 
-export type TrackItem = ClipItem | ShapeItem | TextItem;
+export interface StickerItem extends TrackItemBase {
+  readonly type: "sticker";
+  /** An emoji glyph (or short string) rendered as an overlay graphic. */
+  readonly content: string;
+}
+
+export type TrackItem = ClipItem | ShapeItem | TextItem | StickerItem;
+export type OverlayItem = TextItem | ShapeItem | StickerItem;
 
 /** True for items composited as overlays (rendered from vector/text, not media). */
-export const isOverlayItem = (item: TrackItem): item is TextItem | ShapeItem =>
-  item.type === "text" || item.type === "shape";
+export const isOverlayItem = (item: TrackItem): item is OverlayItem =>
+  item.type === "text" || item.type === "shape" || item.type === "sticker";
 
 /** Factory: a text overlay with sensible defaults, ready for `addItemToTrack`. */
 export const makeTextItem = (startFrame: number, durationFrames: number): Omit<TextItem, "id"> => ({
@@ -253,6 +296,22 @@ export const makeShapeItem = (
   cornerRadiusPx: 0,
 });
 
+/** Factory: an emoji/graphic sticker overlay. */
+export const makeStickerItem = (
+  content: string,
+  startFrame: number,
+  durationFrames: number,
+): Omit<StickerItem, "id"> => ({
+  type: "sticker",
+  name: "Sticker",
+  startFrame,
+  durationFrames,
+  transform: identityTransform(),
+  effects: [],
+  locked: false,
+  content,
+});
+
 // ---------------------------------------------------------------------------
 // Tracks
 // ---------------------------------------------------------------------------
@@ -283,7 +342,39 @@ export interface ProjectSettings {
   readonly frameRate: number;
   readonly sampleRate: number;
   readonly backgroundColor: string;
+  /** When set, a gradient fills the canvas behind all layers. */
+  readonly backgroundGradient?: GradientFill;
 }
+
+// ---------------------------------------------------------------------------
+// Subtitles / captions
+// ---------------------------------------------------------------------------
+
+export type SubtitleId = string & { readonly __brand: "SubtitleId" };
+
+export interface Subtitle {
+  readonly id: SubtitleId;
+  readonly startFrame: number;
+  readonly endFrame: number;
+  readonly text: string;
+}
+
+export interface SubtitleStyle {
+  readonly fontFamily: string;
+  readonly fontSizePx: number;
+  readonly fillColor: string;
+  readonly backgroundColor: string;
+  /** Vertical position as a fraction of canvas height (0 = top, 1 = bottom). */
+  readonly positionY: number;
+}
+
+export const defaultSubtitleStyle = (): SubtitleStyle => ({
+  fontFamily: "Inter, system-ui, sans-serif",
+  fontSizePx: 48,
+  fillColor: "#ffffff",
+  backgroundColor: "#000000a0",
+  positionY: 0.86,
+});
 
 /** Common canvas presets for quick aspect-ratio switching. */
 export interface AspectPreset {
@@ -328,6 +419,8 @@ export interface Project {
   readonly assets: readonly MediaAsset[];
   readonly tracks: readonly Track[];
   readonly markers: readonly Marker[];
+  readonly subtitles: readonly Subtitle[];
+  readonly subtitleStyle: SubtitleStyle;
 }
 
 export const createEmptyProject = (name = "Untitled Project"): Project => {
@@ -347,6 +440,8 @@ export const createEmptyProject = (name = "Untitled Project"): Project => {
     },
     assets: [],
     markers: [],
+    subtitles: [],
+    subtitleStyle: defaultSubtitleStyle(),
     tracks: [
       {
         id: createId<TrackId>(),

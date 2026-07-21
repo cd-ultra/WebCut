@@ -10,7 +10,7 @@
  * written via showSaveFilePicker, so projects remain portable and inspectable.
  */
 
-import type { Project } from "../types/timeline";
+import { defaultSubtitleStyle, type Project } from "../types/timeline";
 
 // ---------------------------------------------------------------------------
 // File System Access API ambient declarations
@@ -321,7 +321,12 @@ export class FileSystemService {
     }
     this.projectHandle = handle;
     // Backfill fields added after a project was first saved.
-    return { ...parsed, markers: parsed.markers ?? [] };
+    return {
+      ...parsed,
+      markers: parsed.markers ?? [],
+      subtitles: parsed.subtitles ?? [],
+      subtitleStyle: parsed.subtitleStyle ?? defaultSubtitleStyle(),
+    };
   }
 
   private async writeProjectToHandle(project: Project, handle: FileSystemFileHandle): Promise<void> {

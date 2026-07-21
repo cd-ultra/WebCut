@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
+  Captions,
   Circle,
   Clapperboard,
   FileAudio,
@@ -18,8 +19,10 @@ import {
   FolderOpen,
   Image as ImageIcon,
   Import,
+  LayoutDashboard,
   LayoutGrid,
   List,
+  Music,
   Plus,
   Save,
   SlidersHorizontal,
@@ -38,21 +41,33 @@ import {
   isMediaFile,
   probeMedia,
 } from "../services/mediaImport";
+import { projectStore, type ProjectSummary } from "../services/projectStore";
+import { SOUND_LIBRARY, soundToFile } from "../services/sounds";
+import { parseCaptions, toSrt } from "../services/subtitles";
 import { transport, useTimelineStore } from "../store/timelineStore";
 import {
   ASPECT_PRESETS,
   createId,
+  BLEND_MODES,
+  createEmptyProject,
   defaultCorridorKeyParams,
   framesToTimecode,
+  GRADIENT_PRESETS,
   identityTransform,
   makeShapeItem,
+  makeStickerItem,
   makeTextItem,
   sampleAnimatable,
   staticValue,
+  type BezierHandles,
+  type BlendMode,
   type ClipItem,
   type CorridorKeyParams,
   type Effect,
   type EffectId,
+  type GradientFill,
+  type InterpolationMode,
+  type KeyframeId,
   type MediaAsset,
   type MediaAssetId,
   type MediaKind,
@@ -63,6 +78,7 @@ import {
   type Transform,
   type Vec2,
 } from "../types/timeline";
+import type { TransformProp } from "../store/timelineStore";
 
 /** Signature of the store's generic item updater, shared by Inspector sections. */
 type UpdateItemFn = (itemId: TrackItemId, updater: (item: TrackItem) => TrackItem, coalesceKey?: string) => void;
@@ -84,6 +100,14 @@ const FONT_OPTIONS: readonly string[] = [
 ];
 
 const fontLabel = (stack: string): string => stack.split(",")[0].replace(/['"]/g, "").trim();
+
+/** Emoji sticker set offered in the Media Pool. */
+const STICKERS: readonly string[] = [
+  "😀", "😂", "😍", "😎", "🤔", "😭", "🔥", "✨", "⭐", "❤️",
+  "👍", "👎", "👏", "🙌", "💯", "🎉", "🎈", "🎁", "💡", "⚡",
+  "✅", "❌", "❓", "❗", "➡️", "⬅️", "⬆️", "⬇️", "📌", "🏆",
+  "🇺🇸", "🇬🇧", "🇪🇺", "🇯🇵", "🇧🇷", "🇮🇳", "🌍", "☀️", "🌙", "☁️",
+];
 
 // ---------------------------------------------------------------------------
 // Media pool
@@ -333,6 +357,23 @@ const MediaPool = () => {
             onClick={() => insertOverlay((s, d) => makeShapeItem("ellipse", s, d))}
           />
         </div>
+        <details className="mt-2">
+          <summary className="cursor-pointer list-none text-[10px] text-neutral-400 hover:text-neutral-200">
+            😀 Stickers
+          </summary>
+          <div className="mt-1 grid grid-cols-8 gap-0.5">
+            {STICKERS.map((emoji) => (
+              <button
+                key={emoji}
+                title={`Add ${emoji}`}
+                onClick={() => insertOverlay((s, d) => makeStickerItem(emoji, s, d))}
+                className="rounded p-0.5 text-base hover:bg-panel-raised"
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        </details>
         <div className="mt-2 flex items-center justify-between">
           <span className="text-[9px] uppercase tracking-wide text-neutral-600">
             {assets.length} item{assets.length === 1 ? "" : "s"}
@@ -482,41 +523,235 @@ const ColorInput = ({
   </label>
 );
 
+/** ◆ toggle: animate a property on/off, at the current playhead. */
+const KeyToggle = ({ animated, onClick }: { animated: boolean; onClick: () => void }) => (
+  <button
+    title={animated ? "Property is animated — click to remove keyframes" : "Add keyframe at playhead"}
+    onClick={onClick}
+    className={`ml-1 rounded px-1 text-[10px] leading-none ${animated ? "text-accent-warm" : "text-neutral-600 hover:text-neutral-300"}`}
+  >
+    {animated ? "◆" : "◇"}
+  </button>
+);
+
 const TransformSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
-  const pos = sampleAnimatable(item.transform.position, 0);
-  const scale = sampleAnimatable(item.transform.scale, 0);
-  const rotation = sampleAnimatable(item.transform.rotation, 0);
-  const opacity = sampleAnimatable(item.transform.opacity, 0);
+  const addKeyframe = useTimelineStore((s) => s.addTransformKeyframe);
+  const clearKeyframes = useTimelineStore((s) => s.clearTransformKeyframes);
+  const local = Math.max(0, Math.round(transport.getFrame()) - item.startFrame);
+  const pos = sampleAnimatable(item.transform.position, local);
+  const scale = sampleAnimatable(item.transform.scale, local);
+  const rotation = sampleAnimatable(item.transform.rotation, local);
+  const opacity = sampleAnimatable(item.transform.opacity, local);
+
   const setTransform = (patch: Partial<Transform>) =>
     updateItem(item.id, (it) => ({ ...it, transform: { ...it.transform, ...patch } }) as TrackItem, "transform");
-  const setPosition = (next: Vec2) => setTransform({ position: staticValue(next) });
-  const setScale = (next: Vec2) => setTransform({ scale: staticValue(next) });
+
+  // Upsert a keyframe at the playhead when animated; otherwise set the static value.
+  const setVec = (prop: "position" | "scale", next: Vec2) => {
+    const av = item.transform[prop];
+    if (av.kind === "static") return setTransform({ [prop]: staticValue(next) } as Partial<Transform>);
+    const keyframes = [
+      ...av.keyframes.filter((k) => k.frame !== local),
+      { id: createId<KeyframeId>(), frame: local, value: next, interpolation: "linear" as const },
+    ].sort((a, b) => a.frame - b.frame);
+    setTransform({ [prop]: { kind: "animated", keyframes } } as Partial<Transform>);
+  };
+  const setNum = (prop: "rotation" | "opacity", next: number) => {
+    const av = item.transform[prop];
+    if (av.kind === "static") return setTransform({ [prop]: staticValue(next) } as Partial<Transform>);
+    const keyframes = [
+      ...av.keyframes.filter((k) => k.frame !== local),
+      { id: createId<KeyframeId>(), frame: local, value: next, interpolation: "linear" as const },
+    ].sort((a, b) => a.frame - b.frame);
+    setTransform({ [prop]: { kind: "animated", keyframes } } as Partial<Transform>);
+  };
+
+  const toggle = (prop: TransformProp) => {
+    if (item.transform[prop].kind === "animated") clearKeyframes(item.id, prop, local);
+    else addKeyframe(item.id, prop, local);
+  };
+  const animated = (prop: TransformProp) => item.transform[prop].kind === "animated";
+
   return (
     <Section title="Transform">
+      <div className="mb-1 flex items-center justify-between text-[9px] uppercase tracking-wide text-neutral-500">
+        <span>Position</span>
+        <KeyToggle animated={animated("position")} onClick={() => toggle("position")} />
+      </div>
       <div className="grid grid-cols-2 gap-2">
-        <NumberField label="X" value={pos.x} onChange={(x) => setPosition({ x, y: pos.y })} />
-        <NumberField label="Y" value={pos.y} onChange={(y) => setPosition({ x: pos.x, y })} />
-        <NumberField label="Scale X" value={scale.x} step={0.01} onChange={(x) => setScale({ x, y: scale.y })} />
-        <NumberField label="Scale Y" value={scale.y} step={0.01} onChange={(y) => setScale({ x: scale.x, y })} />
-        <NumberField
-          label="Rotation°"
-          value={rotation}
-          onChange={(r) => setTransform({ rotation: staticValue(r) })}
-        />
+        <NumberField label="X" value={pos.x} onChange={(x) => setVec("position", { x, y: pos.y })} />
+        <NumberField label="Y" value={pos.y} onChange={(y) => setVec("position", { x: pos.x, y })} />
       </div>
-      <div className="mt-1">
-        <SliderRow
-          label="Opacity"
-          value={opacity}
-          min={0}
-          max={1}
-          step={0.01}
-          onChange={(o) => setTransform({ opacity: staticValue(o) })}
-        />
+      <div className="mb-1 mt-2 flex items-center justify-between text-[9px] uppercase tracking-wide text-neutral-500">
+        <span>Scale</span>
+        <KeyToggle animated={animated("scale")} onClick={() => toggle("scale")} />
       </div>
+      <div className="grid grid-cols-2 gap-2">
+        <NumberField label="X" value={scale.x} step={0.01} onChange={(x) => setVec("scale", { x, y: scale.y })} />
+        <NumberField label="Y" value={scale.y} step={0.01} onChange={(y) => setVec("scale", { x: scale.x, y })} />
+      </div>
+      <div className="mt-2 flex items-center gap-2">
+        <div className="flex-1">
+          <NumberField label="Rotation°" value={rotation} onChange={(r) => setNum("rotation", r)} />
+        </div>
+        <KeyToggle animated={animated("rotation")} onClick={() => toggle("rotation")} />
+      </div>
+      <div className="mt-1 flex items-center gap-1">
+        <div className="flex-1">
+          <SliderRow label="Opacity" value={opacity} min={0} max={1} step={0.01} onChange={(o) => setNum("opacity", o)} />
+        </div>
+        <KeyToggle animated={animated("opacity")} onClick={() => toggle("opacity")} />
+      </div>
+      <KeyframeGraph item={item} updateItem={updateItem} />
     </Section>
   );
 };
+
+const DEFAULT_BEZIER: BezierHandles = { out: [0.42, 0], in: [0.58, 1] };
+
+/** Compact draggable cubic-bezier easing editor for a keyframe. */
+const BezierEditor = ({ bezier, onChange }: { bezier: BezierHandles; onChange: (b: BezierHandles) => void }) => {
+  const [drag, setDrag] = useState<null | "out" | "in">(null);
+  const size = 96;
+  const p1 = { cx: bezier.out[0] * size, cy: (1 - bezier.out[1]) * size };
+  const p2 = { cx: bezier.in[0] * size, cy: (1 - bezier.in[1]) * size };
+  const onMove = (event: React.PointerEvent) => {
+    if (!drag) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = Math.min(1, Math.max(0, (event.clientX - rect.left) / size));
+    const y = Math.min(1.5, Math.max(-0.5, 1 - (event.clientY - rect.top) / size));
+    onChange(drag === "out" ? { ...bezier, out: [x, y] } : { ...bezier, in: [x, y] });
+  };
+  return (
+    <svg
+      width={size}
+      height={size}
+      className="mt-1 rounded bg-panel-deep"
+      onPointerMove={onMove}
+      onPointerUp={() => setDrag(null)}
+      onPointerLeave={() => setDrag(null)}
+    >
+      <line x1={0} y1={size} x2={p1.cx} y2={p1.cy} stroke="#555" />
+      <line x1={size} y1={0} x2={p2.cx} y2={p2.cy} stroke="#555" />
+      <path
+        d={`M0,${size} C${p1.cx},${p1.cy} ${p2.cx},${p2.cy} ${size},0`}
+        stroke="var(--color-accent)"
+        fill="none"
+        strokeWidth={1.5}
+      />
+      <circle cx={p1.cx} cy={p1.cy} r={5} fill="var(--color-accent)" className="cursor-grab" onPointerDown={() => setDrag("out")} />
+      <circle cx={p2.cx} cy={p2.cy} r={5} fill="var(--color-accent-warm)" className="cursor-grab" onPointerDown={() => setDrag("in")} />
+    </svg>
+  );
+};
+
+const KeyframeGraph = ({ item }: { item: TrackItem; updateItem: UpdateItemFn }) => {
+  const updateKf = useTimelineStore((s) => s.updateTransformKeyframe);
+  const removeKf = useTimelineStore((s) => s.removeTransformKeyframe);
+  const props: TransformProp[] = ["position", "scale", "rotation", "opacity"];
+  const animated = props.filter((p) => item.transform[p].kind === "animated");
+  if (animated.length === 0) return null;
+  return (
+    <div className="mt-3 rounded border border-edge bg-panel/40 p-2">
+      <p className="mb-1 text-[9px] uppercase tracking-wide text-neutral-500">Keyframes</p>
+      {animated.map((prop) => {
+        const av = item.transform[prop];
+        if (av.kind !== "animated") return null;
+        const bezierKf = av.keyframes.find((k) => k.interpolation === "bezier");
+        return (
+          <div key={prop} className="mb-2">
+            <p className="text-[10px] capitalize text-neutral-400">{prop}</p>
+            {av.keyframes.map((k) => (
+              <div key={k.id} className="mt-1 flex items-center gap-1 text-[10px]">
+                <span className="w-9 font-mono text-neutral-500">f{k.frame}</span>
+                <select
+                  value={k.interpolation}
+                  onChange={(event) => {
+                    const mode = event.target.value as InterpolationMode;
+                    updateKf(item.id, prop, k.id, {
+                      interpolation: mode,
+                      bezier: mode === "bezier" ? (k.bezier ?? DEFAULT_BEZIER) : undefined,
+                    });
+                  }}
+                  className="rounded border border-edge bg-panel-raised px-1 py-0.5 text-[10px] text-neutral-200"
+                >
+                  <option value="linear">Linear</option>
+                  <option value="bezier">Bezier</option>
+                  <option value="hold">Hold</option>
+                </select>
+                <button onClick={() => removeKf(item.id, prop, k.id)} className="text-neutral-600 hover:text-red-400">
+                  ✕
+                </button>
+              </div>
+            ))}
+            {bezierKf && bezierKf.bezier && (
+              <BezierEditor
+                bezier={bezierKf.bezier}
+                onChange={(bez) => updateKf(item.id, prop, bezierKf.id, { bezier: bez })}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+const cssGradient = (g: GradientFill): string => {
+  const stops = g.stops.map((s) => `${s.color} ${Math.round(s.at * 100)}%`).join(", ");
+  return g.kind === "radial" ? `radial-gradient(circle, ${stops})` : `linear-gradient(${g.angle}deg, ${stops})`;
+};
+
+const GradientRow = ({
+  gradient,
+  onChange,
+}: {
+  gradient: GradientFill | undefined;
+  onChange: (g: GradientFill | undefined) => void;
+}) => (
+  <div className="mt-2">
+    <div className="mb-1 flex items-center justify-between text-[9px] uppercase tracking-wide text-neutral-500">
+      <span>Gradient fill</span>
+      {gradient && (
+        <button onClick={() => onChange(undefined)} className="text-neutral-500 hover:text-neutral-300">
+          clear
+        </button>
+      )}
+    </div>
+    <div className="flex flex-wrap gap-1">
+      {GRADIENT_PRESETS.map((p) => (
+        <button
+          key={p.label}
+          title={p.label}
+          onClick={() => onChange(p.fill)}
+          className="h-5 w-8 rounded border border-edge"
+          style={{ background: cssGradient(p.fill) }}
+        />
+      ))}
+    </div>
+  </div>
+);
+
+const BlendSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => (
+  <Section title="Compositing">
+    <label className="block">
+      <span className="mb-0.5 block text-[9px] uppercase tracking-wide text-neutral-500">Blend mode</span>
+      <select
+        value={item.blendMode ?? "normal"}
+        onChange={(event) =>
+          updateItem(item.id, (it) => ({ ...it, blendMode: event.target.value as BlendMode }) as TrackItem, "blend")
+        }
+        className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] capitalize text-neutral-200"
+      >
+        {BLEND_MODES.map((mode) => (
+          <option key={mode} value={mode}>
+            {mode}
+          </option>
+        ))}
+      </select>
+    </label>
+  </Section>
+);
 
 const TextSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
   if (item.type !== "text") return null;
@@ -580,6 +815,7 @@ const TextSection = ({ item, updateItem }: { item: TrackItem; updateItem: Update
           ))}
         </div>
       </div>
+      <GradientRow gradient={item.fillGradient} onChange={(g) => set({ fillGradient: g })} />
     </Section>
   );
 };
@@ -602,6 +838,7 @@ const ShapeSection = ({ item, updateItem }: { item: TrackItem; updateItem: Updat
           onChange={(v) => set({ cornerRadiusPx: Math.max(0, v) })}
         />
       </div>
+      <GradientRow gradient={item.fillGradient} onChange={(g) => set({ fillGradient: g })} />
     </Section>
   );
 };
@@ -689,6 +926,19 @@ const ProjectSettingsSection = () => {
             onChange={(v) => setProjectSettings({ height: Math.max(16, Math.round(v)) })}
           />
         </div>
+        <label className="mt-2 flex items-center justify-between text-[10px] text-neutral-400">
+          Background
+          <input
+            type="color"
+            value={settings.backgroundColor}
+            onChange={(event) => setProjectSettings({ backgroundColor: event.target.value, backgroundGradient: undefined })}
+            className="h-6 w-8 cursor-pointer rounded border border-edge bg-transparent"
+          />
+        </label>
+        <GradientRow
+          gradient={settings.backgroundGradient}
+          onChange={(g) => setProjectSettings({ backgroundGradient: g })}
+        />
         <p className="mt-3 text-center text-[10px] leading-relaxed text-neutral-600">
           Select a clip, text, or shape on the timeline to edit its properties.
         </p>
@@ -755,6 +1005,7 @@ const Inspector = () => {
             <TextSection item={selectedItem} updateItem={updateItem} />
             <ShapeSection item={selectedItem} updateItem={updateItem} />
             <ClipSection item={selectedItem} updateItem={updateItem} />
+            <BlendSection item={selectedItem} updateItem={updateItem} />
 
             {selectedItem.type === "clip" && (
               <div className="mb-3 mt-1 flex items-center gap-2">
@@ -941,6 +1192,262 @@ const DiagnosticsPanel = ({ onClose }: { onClose: () => void }) => {
 };
 
 // ---------------------------------------------------------------------------
+// Modals: subtitles, sounds, projects
+// ---------------------------------------------------------------------------
+
+const Modal = ({
+  title,
+  icon,
+  wide,
+  onClose,
+  children,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  wide?: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+}) => (
+  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+    <div
+      className={`flex max-h-[85vh] w-full flex-col rounded-lg border border-edge bg-panel shadow-2xl ${wide ? "max-w-2xl" : "max-w-md"}`}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <div className="flex items-center gap-2 border-b border-edge px-4 py-3">
+        {icon}
+        <span className="text-xs font-semibold tracking-wide text-neutral-200">{title}</span>
+        <div className="flex-1" />
+        <button onClick={onClose} className="rounded px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-panel-raised">
+          Close
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-4">{children}</div>
+    </div>
+  </div>
+);
+
+const SubtitlesPanel = ({ onClose }: { onClose: () => void }) => {
+  const subtitles = useTimelineStore((s) => s.project.subtitles);
+  const style = useTimelineStore((s) => s.project.subtitleStyle);
+  const fps = useTimelineStore((s) => s.project.settings.frameRate);
+  const addSubtitle = useTimelineStore((s) => s.addSubtitle);
+  const updateSubtitle = useTimelineStore((s) => s.updateSubtitle);
+  const removeSubtitle = useTimelineStore((s) => s.removeSubtitle);
+  const setSubtitles = useTimelineStore((s) => s.setSubtitles);
+  const setStyle = useTimelineStore((s) => s.setSubtitleStyle);
+  const [importText, setImportText] = useState("");
+
+  const exportSrt = () => {
+    const blob = new Blob([toSrt(subtitles, fps)], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "captions.srt";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  return (
+    <Modal title="SUBTITLES" icon={<Captions size={14} className="text-accent" />} onClose={onClose} wide>
+      <div className="mb-3 flex flex-wrap gap-2">
+        <button
+          onClick={() => addSubtitle(transport.getFrame(), transport.getFrame() + fps * 2, "New caption")}
+          className="rounded border border-edge bg-panel-raised px-2 py-1 text-[11px] text-neutral-200 hover:border-accent/60"
+        >
+          + Cue at playhead
+        </button>
+        <button onClick={exportSrt} className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
+          Export .srt
+        </button>
+      </div>
+
+      <div className="mb-3 grid grid-cols-4 gap-2 rounded border border-edge bg-panel/40 p-2 text-[10px]">
+        <NumberField label="Size" value={style.fontSizePx} onChange={(v) => setStyle({ fontSizePx: Math.max(8, v) })} />
+        <label className="block">
+          <span className="mb-0.5 block text-[9px] uppercase tracking-wide text-neutral-500">Text</span>
+          <input type="color" value={style.fillColor} onChange={(e) => setStyle({ fillColor: e.target.value })} className="h-7 w-full rounded border border-edge bg-transparent" />
+        </label>
+        <NumberField label="Pos Y %" value={Math.round(style.positionY * 100)} onChange={(v) => setStyle({ positionY: Math.min(1, Math.max(0, v / 100)) })} />
+        <div className="flex items-end text-neutral-500">{subtitles.length} cues</div>
+      </div>
+
+      <div className="space-y-1">
+        {subtitles.map((cue) => (
+          <div key={cue.id} className="flex items-center gap-1 rounded border border-edge bg-panel-raised/50 p-1">
+            <input
+              value={cue.text}
+              onChange={(e) => updateSubtitle(cue.id, { text: e.target.value })}
+              className="min-w-0 flex-1 rounded bg-panel px-1.5 py-1 text-[11px] text-neutral-200 outline-none"
+            />
+            <input type="number" value={cue.startFrame} onChange={(e) => updateSubtitle(cue.id, { startFrame: Number(e.target.value) })} className="w-16 rounded bg-panel px-1 py-1 text-[10px] text-neutral-400" />
+            <input type="number" value={cue.endFrame} onChange={(e) => updateSubtitle(cue.id, { endFrame: Number(e.target.value) })} className="w-16 rounded bg-panel px-1 py-1 text-[10px] text-neutral-400" />
+            <button onClick={() => removeSubtitle(cue.id)} className="px-1 text-neutral-500 hover:text-red-400">✕</button>
+          </div>
+        ))}
+      </div>
+
+      <p className="mb-1 mt-3 text-[9px] uppercase tracking-wide text-neutral-500">Import SRT / VTT</p>
+      <textarea
+        value={importText}
+        onChange={(e) => setImportText(e.target.value)}
+        rows={3}
+        placeholder="Paste .srt or .vtt content…"
+        className="w-full resize-none rounded border border-edge bg-panel-raised px-2 py-1 text-[10px] text-neutral-200 outline-none"
+      />
+      <button
+        onClick={() => {
+          const parsed = parseCaptions(importText, fps);
+          if (parsed.length > 0) setSubtitles([...subtitles, ...parsed]);
+          setImportText("");
+        }}
+        className="mt-1 rounded border border-edge bg-panel-raised px-2 py-1 text-[11px] text-neutral-200 hover:border-accent/60"
+      >
+        Import
+      </button>
+    </Modal>
+  );
+};
+
+const SoundsPanel = ({ onClose, onStatus }: { onClose: () => void; onStatus: (m: string) => void }) => {
+  const tracks = useTimelineStore((s) => s.project.tracks);
+  const frameRate = useTimelineStore((s) => s.project.settings.frameRate);
+  const addAsset = useTimelineStore((s) => s.addAsset);
+  const addClipToTrack = useTimelineStore((s) => s.addClipToTrack);
+
+  const preview = (def: (typeof SOUND_LIBRARY)[number]) => {
+    const url = URL.createObjectURL(def.make());
+    const audio = new Audio(url);
+    void audio.play().finally(() => setTimeout(() => URL.revokeObjectURL(url), 3000));
+  };
+
+  const add = async (def: (typeof SOUND_LIBRARY)[number]) => {
+    const [asset] = await ingestFiles([soundToFile(def)], frameRate);
+    if (!asset) return;
+    addAsset(asset);
+    const track = tracks.find((t) => t.kind === "audio" && !t.locked);
+    if (track) {
+      addClipToTrack(track.id, {
+        type: "clip",
+        name: def.name,
+        assetId: asset.id,
+        startFrame: Math.round(transport.getFrame()),
+        durationFrames: asset.durationFrames,
+        sourceInFrame: 0,
+        speed: 1,
+        audioGainDb: 0,
+        audioMuted: false,
+        transform: identityTransform(),
+        effects: [],
+        locked: false,
+      });
+    }
+    onStatus(`Added ${def.name}`);
+  };
+
+  return (
+    <Modal title="SOUNDS" icon={<Music size={14} className="text-accent" />} onClose={onClose}>
+      <p className="mb-2 text-[10px] text-neutral-500">Built-in sounds, synthesized locally and added to an audio track at the playhead.</p>
+      <div className="space-y-1">
+        {SOUND_LIBRARY.map((def) => (
+          <div key={def.name} className="flex items-center gap-2 rounded border border-edge bg-panel-raised/50 px-2 py-1.5">
+            <Music size={13} className="text-accent" />
+            <span className="flex-1 text-[11px] text-neutral-200">{def.name}</span>
+            <span className="font-mono text-[9px] text-neutral-500">{def.durationS.toFixed(2)}s</span>
+            <button onClick={() => preview(def)} className="rounded px-2 py-0.5 text-[10px] text-neutral-400 hover:bg-panel">
+              Preview
+            </button>
+            <button onClick={() => void add(def)} className="rounded bg-accent/80 px-2 py-0.5 text-[10px] text-white hover:bg-accent">
+              Add
+            </button>
+          </div>
+        ))}
+      </div>
+    </Modal>
+  );
+};
+
+const ProjectsPanel = ({ onClose, onStatus }: { onClose: () => void; onStatus: (m: string) => void }) => {
+  const setProject = useTimelineStore((s) => s.setProject);
+  const [list, setList] = useState<ProjectSummary[]>([]);
+  const currentId = useTimelineStore((s) => s.project.id);
+
+  const refresh = useCallback(() => {
+    void projectStore.list().then(setList);
+  }, []);
+  useEffect(() => refresh(), [refresh]);
+
+  const saveCurrent = async () => {
+    await projectStore.save(useTimelineStore.getState().project);
+    onStatus("Saved to project library");
+    refresh();
+  };
+  const open = async (id: ProjectSummary["id"]) => {
+    const project = await projectStore.load(id);
+    if (project) {
+      setProject(project);
+      onStatus("Project opened");
+      onClose();
+    }
+  };
+
+  return (
+    <Modal title="PROJECTS" icon={<LayoutDashboard size={14} className="text-accent" />} onClose={onClose}>
+      <div className="mb-3 flex gap-2">
+        <button onClick={saveCurrent} className="rounded bg-accent/80 px-2 py-1 text-[11px] text-white hover:bg-accent">
+          Save current
+        </button>
+        <button
+          onClick={() => {
+            setProject(createEmptyProject());
+            onClose();
+          }}
+          className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60"
+        >
+          New project
+        </button>
+      </div>
+      {list.length === 0 && <p className="text-center text-[11px] text-neutral-600">No saved projects yet.</p>}
+      <div className="space-y-1">
+        {list.map((p) => (
+          <div key={p.id} className="flex items-center gap-2 rounded border border-edge bg-panel-raised/50 px-2 py-1.5">
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[11px] text-neutral-200">
+                {p.name}
+                {p.id === currentId && <span className="ml-1 text-[9px] text-accent">(current)</span>}
+              </p>
+              <p className="font-mono text-[9px] text-neutral-500">{new Date(p.updatedAt).toLocaleString()}</p>
+            </div>
+            <button onClick={() => void open(p.id)} className="rounded px-2 py-0.5 text-[10px] text-neutral-300 hover:bg-panel">
+              Open
+            </button>
+            <button
+              onClick={async () => {
+                const name = window.prompt("Project name", p.name);
+                if (name) {
+                  await projectStore.rename(p.id, name);
+                  refresh();
+                }
+              }}
+              className="rounded px-2 py-0.5 text-[10px] text-neutral-400 hover:bg-panel"
+            >
+              Rename
+            </button>
+            <button
+              onClick={async () => {
+                await projectStore.remove(p.id);
+                refresh();
+              }}
+              className="px-1 text-neutral-500 hover:text-red-400"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+      </div>
+    </Modal>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Main layout
 // ---------------------------------------------------------------------------
 
@@ -951,6 +1458,12 @@ export const MainLayout = () => {
   const frameRate = useTimelineStore((state) => state.project.settings.frameRate);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [showDiag, setShowDiag] = useState(false);
+  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects">(null);
+
+  const flashStatus = useCallback((message: string) => {
+    setStatusMessage(message);
+    window.setTimeout(() => setStatusMessage(null), 2500);
+  }, []);
 
   // Paste-to-import: media files on the clipboard become assets (no picker).
   useEffect(() => {
@@ -1037,6 +1550,15 @@ export const MainLayout = () => {
 
         {statusMessage && <span className="text-[11px] text-accent">{statusMessage}</span>}
 
+        <button onClick={() => setModal("projects")} title="Projects" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
+          <LayoutDashboard size={12} />
+        </button>
+        <button onClick={() => setModal("sounds")} title="Sounds library" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
+          <Music size={12} />
+        </button>
+        <button onClick={() => setModal("subtitles")} title="Subtitles" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
+          <Captions size={12} />
+        </button>
         <button
           onClick={() => setShowDiag(true)}
           title="Diagnostics"
@@ -1077,6 +1599,9 @@ export const MainLayout = () => {
       </div>
 
       {showDiag && <DiagnosticsPanel onClose={() => setShowDiag(false)} />}
+      {modal === "subtitles" && <SubtitlesPanel onClose={() => setModal(null)} />}
+      {modal === "sounds" && <SoundsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
+      {modal === "projects" && <ProjectsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
     </div>
   );
 };
