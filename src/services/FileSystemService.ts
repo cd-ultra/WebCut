@@ -320,7 +320,8 @@ export class FileSystemService {
       throw new Error(`"${file.name}" is not a valid WebCut project file.`);
     }
     this.projectHandle = handle;
-    return parsed;
+    // Backfill fields added after a project was first saved.
+    return { ...parsed, markers: parsed.markers ?? [] };
   }
 
   private async writeProjectToHandle(project: Project, handle: FileSystemFileHandle): Promise<void> {

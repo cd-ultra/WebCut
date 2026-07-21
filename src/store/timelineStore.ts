@@ -20,8 +20,11 @@ import { subscribeWithSelector } from "zustand/middleware";
 import {
   createEmptyProject,
   createId,
+  MARKER_COLORS,
   type ClipItem,
   type Effect,
+  type Marker,
+  type MarkerId,
   type MediaAsset,
   type Project,
   type ProjectSettings,
@@ -163,6 +166,9 @@ export interface TimelineState {
   updateItemEffects(itemId: TrackItemId, effects: readonly Effect[]): void;
   updateItem(itemId: TrackItemId, updater: (item: TrackItem) => TrackItem, coalesceKey?: string): void;
   setProjectSettings(patch: Partial<ProjectSettings>): void;
+  addMarker(frame: number): void;
+  updateMarker(markerId: MarkerId, patch: Partial<Pick<Marker, "label" | "color" | "frame">>): void;
+  removeMarker(markerId: MarkerId): void;
   toggleTrackFlag(trackId: TrackId, flag: "muted" | "soloed" | "locked" | "hidden"): void;
   // clipboard + history
   copySelection(): void;
@@ -468,6 +474,45 @@ export const useTimelineStore = create<TimelineState>()(
         project: { ...state.project, settings: { ...state.project.settings, ...patch } },
         revision: state.revision + 1,
         ...pushPastCoalesced(state, "settings"),
+      })),
+
+    addMarker: (frame) =>
+      set((state) => {
+        const wholeFrame = Math.max(0, Math.round(frame));
+        const marker: Marker = {
+          id: createId<MarkerId>(),
+          frame: wholeFrame,
+          label: "",
+          color: MARKER_COLORS[state.project.markers.length % MARKER_COLORS.length],
+        };
+        const markers = [...state.project.markers, marker].sort((a, b) => a.frame - b.frame);
+        return {
+          project: { ...state.project, markers },
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
+
+    updateMarker: (markerId, patch) =>
+      set((state) => ({
+        project: {
+          ...state.project,
+          markers: state.project.markers
+            .map((marker) => (marker.id === markerId ? { ...marker, ...patch } : marker))
+            .sort((a, b) => a.frame - b.frame),
+        },
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, `marker:${markerId}`),
+      })),
+
+    removeMarker: (markerId) =>
+      set((state) => ({
+        project: {
+          ...state.project,
+          markers: state.project.markers.filter((marker) => marker.id !== markerId),
+        },
+        revision: state.revision + 1,
+        ...pushPast(state),
       })),
 
     toggleTrackFlag: (trackId, flag) =>

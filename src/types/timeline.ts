@@ -14,6 +14,7 @@ export type TrackItemId = string & { readonly __brand: "TrackItemId" };
 export type MediaAssetId = string & { readonly __brand: "MediaAssetId" };
 export type EffectId = string & { readonly __brand: "EffectId" };
 export type KeyframeId = string & { readonly __brand: "KeyframeId" };
+export type MarkerId = string & { readonly __brand: "MarkerId" };
 
 export const createId = <T extends string>(): T =>
   (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`) as T;
@@ -300,6 +301,23 @@ export const ASPECT_PRESETS: readonly AspectPreset[] = [
   { label: "21:9 · 2560×1080", width: 2560, height: 1080 },
 ];
 
+/** A timeline bookmark at a given frame, with an optional label and color. */
+export interface Marker {
+  readonly id: MarkerId;
+  readonly frame: number;
+  readonly label: string;
+  readonly color: string;
+}
+
+export const MARKER_COLORS: readonly string[] = [
+  "#e0b65f",
+  "#4f8cff",
+  "#5fd0a0",
+  "#e06f9e",
+  "#b07fe0",
+  "#e07f5f",
+];
+
 export interface Project {
   readonly id: ProjectId;
   readonly schemaVersion: 1;
@@ -309,6 +327,7 @@ export interface Project {
   readonly settings: ProjectSettings;
   readonly assets: readonly MediaAsset[];
   readonly tracks: readonly Track[];
+  readonly markers: readonly Marker[];
 }
 
 export const createEmptyProject = (name = "Untitled Project"): Project => {
@@ -327,6 +346,7 @@ export const createEmptyProject = (name = "Untitled Project"): Project => {
       backgroundColor: "#000000",
     },
     assets: [],
+    markers: [],
     tracks: [
       {
         id: createId<TrackId>(),

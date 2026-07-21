@@ -19,8 +19,8 @@
  * effect toggles).
  */
 
-import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Gauge, Loader2, Maximize2, RotateCw, ZoomIn, ZoomOut } from "lucide-react";
 import {
   CORRIDOR_KEY_UNIFORM_SIZE,
   createCorridorKeyPass,
@@ -30,7 +30,28 @@ import {
 } from "../effects/CorridorKeyShader";
 import { previewService } from "../services/PreviewService";
 import { transport, useTimelineStore } from "../store/timelineStore";
-import { defaultCorridorKeyParams, type CorridorKeyParams } from "../types/timeline";
+import {
+  defaultCorridorKeyParams,
+  sampleAnimatable,
+  staticValue,
+  type CorridorKeyParams,
+  type TrackItem,
+  type TrackItemId,
+  type Transform,
+} from "../types/timeline";
+
+/** Signature of the store's generic item updater. */
+type UpdateItemFn = (itemId: TrackItemId, updater: (item: TrackItem) => TrackItem, coalesceKey?: string) => void;
+
+const hexToRgbTuple = (hex: string): [number, number, number] => {
+  const clean = hex.replace("#", "");
+  const full = clean.length === 3 ? clean.replace(/(.)/g, "$1$1") : clean.padEnd(6, "0");
+  return [
+    parseInt(full.slice(0, 2), 16) / 255,
+    parseInt(full.slice(2, 4), 16) / 255,
+    parseInt(full.slice(4, 6), 16) / 255,
+  ];
+};
 
 // ---------------------------------------------------------------------------
 // GPU renderer (plain class — lives outside React's render cycle)
@@ -52,6 +73,12 @@ class WebGPUCompositor {
   /** One compositing layer per video track, drawn bottom -> top. */
   private layers = new Map<string, LayerState>();
   private destroyed = false;
+  /** Canvas clear color (project background), linear-ish sRGB in [0,1]. */
+  private clearColor: GPUColor = { r: 0, g: 0, b: 0, a: 1 };
+
+  setBackgroundColor(rgb: readonly [number, number, number]): void {
+    this.clearColor = { r: rgb[0], g: rgb[1], b: rgb[2], a: 1 };
+  }
 
   constructor(init: RendererInit) {
     this.device = init.device;
@@ -180,7 +207,7 @@ class WebGPUCompositor {
       colorAttachments: [
         {
           view: canvasTexture.createView(),
-          clearValue: { r: 0.04, g: 0.045, b: 0.055, a: 1 },
+          clearValue: this.clearColor,
           loadOp: "clear",
           storeOp: "store",
         },
@@ -334,12 +361,39 @@ const initWebGPU = async (canvas: HTMLCanvasElement): Promise<RendererInit & { a
 // React component
 // ---------------------------------------------------------------------------
 
+interface ViewTransform {
+  zoom: number;
+  x: number;
+  y: number;
+}
+
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 8;
+
 export const VideoPlayer = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const compositorRef = useRef<WebGPUCompositor | null>(null);
   const [status, setStatus] = useState<GpuStatus>({ phase: "initializing" });
+  const [view, setView] = useState<ViewTransform>({ zoom: 1, x: 0, y: 0 });
+  const [showFps, setShowFps] = useState(false);
+  const [canvasBox, setCanvasBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
 
   const settings = useTimelineStore((state) => state.project.settings);
+  const selectedItemIds = useTimelineStore((state) => state.selectedItemIds);
+  const tracks = useTimelineStore((state) => state.project.tracks);
+  const updateItem = useTimelineStore((state) => state.updateItem);
+
+  // The on-canvas gizmo only targets overlays (text/shape); clips are drawn
+  // fullscreen by the compositor and ignore transform.
+  const selectedOverlay = useMemo(() => {
+    if (selectedItemIds.length !== 1) return undefined;
+    for (const track of tracks) {
+      const found = track.items.find((item) => item.id === selectedItemIds[0]);
+      if (found) return found.type === "text" || found.type === "shape" ? found : undefined;
+    }
+    return undefined;
+  }, [selectedItemIds, tracks]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -358,12 +412,11 @@ export const VideoPlayer = () => {
           return;
         }
         compositor = new WebGPUCompositor(init);
+        compositor.setBackgroundColor(hexToRgbTuple(useTimelineStore.getState().project.settings.backgroundColor));
         compositorRef.current = compositor;
         unregisterSink = previewService.registerSink(compositor);
         setStatus({ phase: "ready", adapterInfo: init.adapterInfo });
 
-        // Continuous render loop: redraws are cheap (single pass) and keep
-        // the swapchain valid across resizes/scrubs without dirty tracking.
         const loop = () => {
           if (disposed) return;
           compositor?.render();
@@ -380,8 +433,6 @@ export const VideoPlayer = () => {
       }
     })();
 
-    // Scrub invalidation: the transport notifies per-frame; the rAF loop
-    // already repaints, so we only need this hook for future seek-decode.
     const unsubscribe = transport.subscribe(() => {
       /* frame-accurate seek requests dispatch to DecodeBridge here */
     });
@@ -404,13 +455,111 @@ export const VideoPlayer = () => {
     canvas.height = settings.height;
   }, [settings.width, settings.height]);
 
+  // Push the project background color into the compositor clear value.
+  useEffect(() => {
+    compositorRef.current?.setBackgroundColor(hexToRgbTuple(settings.backgroundColor));
+  }, [settings.backgroundColor]);
+
+  // Track the canvas's on-screen rectangle (relative to the container) so the
+  // gizmo overlay can map project pixels ↔ screen pixels through the view zoom.
+  useLayoutEffect(() => {
+    const measure = () => {
+      const canvas = canvasRef.current;
+      const container = containerRef.current;
+      if (!canvas || !container) return;
+      const c = canvas.getBoundingClientRect();
+      const p = container.getBoundingClientRect();
+      setCanvasBox({ left: c.left - p.left, top: c.top - p.top, width: c.width, height: c.height });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    if (canvasRef.current) ro.observe(canvasRef.current);
+    if (containerRef.current) ro.observe(containerRef.current);
+    window.addEventListener("resize", measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [view, settings.width, settings.height]);
+
+  const fitView = useCallback(() => setView({ zoom: 1, x: 0, y: 0 }), []);
+
+  const onWheel = useCallback((event: React.WheelEvent) => {
+    event.preventDefault();
+    setView((prev) => {
+      const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
+      const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prev.zoom * factor));
+      return { ...prev, zoom };
+    });
+  }, []);
+
+  // Drag on empty preview area = pan.
+  const panRef = useRef<{ startX: number; startY: number; ox: number; oy: number } | null>(null);
+  const onBackgroundPointerDown = (event: React.PointerEvent) => {
+    if (event.button !== 0) return;
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    panRef.current = { startX: event.clientX, startY: event.clientY, ox: view.x, oy: view.y };
+  };
+  const onBackgroundPointerMove = (event: React.PointerEvent) => {
+    const pan = panRef.current;
+    if (!pan) return;
+    setView((prev) => ({ ...prev, x: pan.ox + (event.clientX - pan.startX), y: pan.oy + (event.clientY - pan.startY) }));
+  };
+  const onBackgroundPointerUp = () => {
+    panRef.current = null;
+  };
+
   return (
-    <div className="relative flex h-full w-full items-center justify-center bg-black">
-      <canvas
-        ref={canvasRef}
-        className="max-h-full max-w-full object-contain"
-        style={{ aspectRatio: `${settings.width} / ${settings.height}` }}
-      />
+    <div
+      ref={containerRef}
+      className="relative flex h-full w-full items-center justify-center overflow-hidden bg-black"
+      onWheel={onWheel}
+      onPointerDown={onBackgroundPointerDown}
+      onPointerMove={onBackgroundPointerMove}
+      onPointerUp={onBackgroundPointerUp}
+    >
+      <div
+        className="relative"
+        style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` }}
+      >
+        <canvas
+          ref={canvasRef}
+          className="block max-h-full max-w-full object-contain"
+          style={{ aspectRatio: `${settings.width} / ${settings.height}` }}
+        />
+      </div>
+
+      {selectedOverlay && canvasBox && (
+        <TransformGizmo
+          item={selectedOverlay}
+          box={canvasBox}
+          settings={settings}
+          updateItem={updateItem}
+        />
+      )}
+
+      {/* Preview controls */}
+      <div className="absolute left-2 top-2 z-30 flex items-center gap-1 rounded bg-black/50 px-1 py-0.5">
+        <button title="Zoom out" onClick={() => setView((v) => ({ ...v, zoom: Math.max(MIN_ZOOM, v.zoom / 1.2) }))} className="rounded p-1 text-neutral-300 hover:bg-white/10">
+          <ZoomOut size={13} />
+        </button>
+        <span className="w-9 text-center font-mono text-[10px] text-neutral-400">{Math.round(view.zoom * 100)}%</span>
+        <button title="Zoom in" onClick={() => setView((v) => ({ ...v, zoom: Math.min(MAX_ZOOM, v.zoom * 1.2) }))} className="rounded p-1 text-neutral-300 hover:bg-white/10">
+          <ZoomIn size={13} />
+        </button>
+        <button title="Fit" onClick={fitView} className="rounded p-1 text-neutral-300 hover:bg-white/10">
+          <Maximize2 size={13} />
+        </button>
+        <button
+          title="Toggle FPS overlay"
+          onClick={() => setShowFps((s) => !s)}
+          className={`rounded p-1 ${showFps ? "text-accent" : "text-neutral-300 hover:bg-white/10"}`}
+        >
+          <Gauge size={13} />
+        </button>
+      </div>
+
+      {showFps && <FpsBadge />}
 
       {status.phase === "initializing" && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-sm text-neutral-400">
@@ -436,5 +585,151 @@ export const VideoPlayer = () => {
         </span>
       )}
     </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// On-canvas transform gizmo (move / scale / rotate) for overlays, with guides
+// ---------------------------------------------------------------------------
+
+type GizmoMode = "move" | "scale" | "rotate";
+
+const TransformGizmo = ({
+  item,
+  box,
+  settings,
+  updateItem,
+}: {
+  item: TrackItem;
+  box: { left: number; top: number; width: number; height: number };
+  settings: { width: number; height: number };
+  updateItem: UpdateItemFn;
+}) => {
+  const [guides, setGuides] = useState<{ v: boolean; h: boolean }>({ v: false, h: false });
+  const pxPerProject = box.width / settings.width;
+  const pos = sampleAnimatable(item.transform.position, 0);
+  const scale = sampleAnimatable(item.transform.scale, 0);
+  const rotation = sampleAnimatable(item.transform.rotation, 0);
+
+  // Item center in container-relative screen pixels.
+  const cx = box.left + box.width / 2 + pos.x * pxPerProject;
+  const cy = box.top + box.height / 2 + pos.y * pxPerProject;
+
+  const drag = useRef<{ mode: GizmoMode; startX: number; startY: number; base: Transform } | null>(null);
+
+  const begin = (mode: GizmoMode) => (event: React.PointerEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    drag.current = { mode, startX: event.clientX, startY: event.clientY, base: item.transform };
+  };
+
+  const onMove = (event: React.PointerEvent) => {
+    const state = drag.current;
+    if (!state) return;
+    const dxScreen = event.clientX - state.startX;
+    const dyScreen = event.clientY - state.startY;
+    const basePos = sampleAnimatable(state.base.position, 0);
+    const baseScale = sampleAnimatable(state.base.scale, 0);
+    const baseRot = sampleAnimatable(state.base.rotation, 0);
+
+    if (state.mode === "move") {
+      let nx = basePos.x + dxScreen / pxPerProject;
+      let ny = basePos.y + dyScreen / pxPerProject;
+      const snap = 12 / pxPerProject;
+      const showV = Math.abs(nx) < snap;
+      const showH = Math.abs(ny) < snap;
+      if (showV) nx = 0;
+      if (showH) ny = 0;
+      setGuides({ v: showV, h: showH });
+      updateItem(item.id, (it) => ({ ...it, transform: { ...it.transform, position: staticValue({ x: nx, y: ny }) } }) as TrackItem, "canvas");
+    } else if (state.mode === "scale") {
+      // Drag away from / toward the item (down-right grows) via delta only, so
+      // the math is independent of the coordinate space and the view zoom.
+      const factor = Math.max(0.05, 1 + (dxScreen + dyScreen) / 300);
+      const next = Math.max(0.05, ((baseScale.x + baseScale.y) / 2) * factor);
+      updateItem(item.id, (it) => ({ ...it, transform: { ...it.transform, scale: staticValue({ x: next, y: next }) } }) as TrackItem, "canvas");
+    } else {
+      const deg = baseRot + dxScreen * 0.5;
+      updateItem(item.id, (it) => ({ ...it, transform: { ...it.transform, rotation: staticValue(deg) } }) as TrackItem, "canvas");
+    }
+  };
+
+  const end = () => {
+    drag.current = null;
+    setGuides({ v: false, h: false });
+  };
+
+  const handleClass = "absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-accent";
+
+  return (
+    <div className="pointer-events-none absolute inset-0 z-20" onPointerMove={onMove} onPointerUp={end}>
+      {guides.v && <div className="absolute top-0 bottom-0 w-px bg-accent/70" style={{ left: box.left + box.width / 2 }} />}
+      {guides.h && <div className="absolute left-0 right-0 h-px bg-accent/70" style={{ top: box.top + box.height / 2 }} />}
+
+      {/* Move handle (center) */}
+      <button
+        title="Drag to move"
+        onPointerDown={begin("move")}
+        className="pointer-events-auto absolute flex h-6 w-6 -translate-x-1/2 -translate-y-1/2 cursor-move items-center justify-center rounded-full border border-white/70 bg-black/40"
+        style={{ left: cx, top: cy }}
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-white" />
+      </button>
+      {/* Scale handle (offset bottom-right) */}
+      <button
+        title="Drag to scale"
+        onPointerDown={begin("scale")}
+        className={`pointer-events-auto ${handleClass} cursor-nwse-resize`}
+        style={{ left: cx + 46, top: cy + 34 }}
+      />
+      {/* Rotate handle (above) */}
+      <button
+        title="Drag to rotate"
+        onPointerDown={begin("rotate")}
+        className="pointer-events-auto absolute flex h-4 w-4 -translate-x-1/2 -translate-y-1/2 cursor-grab items-center justify-center rounded-full border border-white bg-accent-warm"
+        style={{ left: cx, top: cy - 44 }}
+      >
+        <RotateCw size={9} className="text-black" />
+      </button>
+      <span className="absolute -translate-x-1/2 rounded bg-black/60 px-1 font-mono text-[8px] text-neutral-300" style={{ left: cx, top: cy + 14 }}>
+        {Math.round(scale.x * 100)}% · {Math.round(rotation)}°
+      </span>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// FPS badge — self-measures render cadence via its own rAF loop
+// ---------------------------------------------------------------------------
+
+const FpsBadge = () => {
+  const [stats, setStats] = useState({ fps: 0, ms: 0 });
+  useEffect(() => {
+    let handle = 0;
+    let frames = 0;
+    let last = performance.now();
+    let lastFrame = last;
+    let msAccum = 0;
+    const tick = () => {
+      const now = performance.now();
+      msAccum += now - lastFrame;
+      lastFrame = now;
+      frames += 1;
+      if (now - last >= 500) {
+        setStats({ fps: Math.round((frames * 1000) / (now - last)), ms: Math.round((msAccum / frames) * 10) / 10 });
+        frames = 0;
+        msAccum = 0;
+        last = now;
+      }
+      handle = requestAnimationFrame(tick);
+    };
+    handle = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(handle);
+  }, []);
+  return (
+    <span className="absolute right-3 top-2 z-30 rounded bg-black/60 px-2 py-0.5 font-mono text-[10px] text-accent">
+      {stats.fps} fps · {stats.ms} ms
+    </span>
   );
 };

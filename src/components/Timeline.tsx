@@ -13,10 +13,12 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
+  Bookmark,
   Eye,
   EyeOff,
   Layers,
@@ -34,12 +36,22 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import { ASSET_DND_MIME, ingestFiles } from "../services/mediaImport";
 import {
   transport,
   useTimelineStore,
   useTransportFrame,
 } from "../store/timelineStore";
-import { framesToTimecode, type Track, type TrackItem, type TrackItemId } from "../types/timeline";
+import {
+  framesToTimecode,
+  identityTransform,
+  type Marker,
+  type MediaAsset,
+  type Track,
+  type TrackId,
+  type TrackItem,
+  type TrackItemId,
+} from "../types/timeline";
 
 const HEADER_WIDTH = 168;
 const RULER_HEIGHT = 28;
@@ -201,6 +213,50 @@ const TrackHeader = ({ track }: { track: Track }) => {
 };
 
 // ---------------------------------------------------------------------------
+// Marker pin (ruler)
+// ---------------------------------------------------------------------------
+
+const MarkerPin = ({
+  marker,
+  pixelsPerFrame,
+  onSeek,
+  onRemove,
+  onRelabel,
+}: {
+  marker: Marker;
+  pixelsPerFrame: number;
+  onSeek: () => void;
+  onRemove: () => void;
+  onRelabel: (label: string) => void;
+}) => (
+  <div
+    className="absolute top-0 z-10 -translate-x-1/2"
+    style={{ left: marker.frame * pixelsPerFrame }}
+    onPointerDown={(event) => event.stopPropagation()}
+  >
+    <button
+      title={marker.label || "Marker — click to seek, double-click to rename, right-click to delete"}
+      onClick={onSeek}
+      onDoubleClick={() => {
+        const next = window.prompt("Marker label", marker.label);
+        if (next !== null) onRelabel(next);
+      }}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        onRemove();
+      }}
+      className="block h-0 w-0 border-x-[5px] border-t-[8px] border-x-transparent"
+      style={{ borderTopColor: marker.color }}
+    />
+    {marker.label && (
+      <span className="absolute left-1.5 top-0 whitespace-nowrap text-[8px]" style={{ color: marker.color }}>
+        {marker.label}
+      </span>
+    )}
+  </div>
+);
+
+// ---------------------------------------------------------------------------
 // Timeline
 // ---------------------------------------------------------------------------
 
@@ -219,12 +275,19 @@ export const Timeline = () => {
   const removeItems = useTimelineStore((state) => state.removeItems);
   const rippleDelete = useTimelineStore((state) => state.rippleDelete);
   const addTrack = useTimelineStore((state) => state.addTrack);
+  const addClipToTrack = useTimelineStore((state) => state.addClipToTrack);
+  const addAsset = useTimelineStore((state) => state.addAsset);
+  const markers = useTimelineStore((state) => state.project.markers);
+  const addMarker = useTimelineStore((state) => state.addMarker);
+  const removeMarker = useTimelineStore((state) => state.removeMarker);
+  const updateMarker = useTimelineStore((state) => state.updateMarker);
 
   const displayFrame = useTransportFrame();
   const [isPlaying, setIsPlaying] = useState(false);
   const [snapping, setSnapping] = useState(true);
   const [scrollLeft, setScrollLeft] = useState(0);
   const [menu, setMenu] = useState<{ x: number; y: number; item: TrackItem } | null>(null);
+  const [dropTrackId, setDropTrackId] = useState<TrackId | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -369,6 +432,73 @@ export const Timeline = () => {
     dragRef.current = null;
   };
 
+  // -- Drag & drop from the media pool / OS ----------------------------------
+
+  const insertAssetClip = useCallback(
+    (asset: MediaAsset, preferredTrack: Track, startFrame: number) => {
+      // Audio assets belong on an audio track even if dropped over a video lane.
+      const track =
+        asset.kind === "audio" && preferredTrack.kind !== "audio"
+          ? (tracks.find((t) => t.kind === "audio" && !t.locked) ?? preferredTrack)
+          : preferredTrack;
+      addClipToTrack(track.id, {
+        type: "clip",
+        name: asset.name,
+        assetId: asset.id,
+        startFrame: Math.max(0, Math.round(startFrame)),
+        durationFrames: asset.durationFrames,
+        sourceInFrame: 0,
+        speed: 1,
+        audioGainDb: 0,
+        audioMuted: false,
+        transform: identityTransform(),
+        effects: [],
+        locked: false,
+      });
+    },
+    [tracks, addClipToTrack],
+  );
+
+  const onLaneDragOver = (event: ReactDragEvent, track: Track) => {
+    const dt = event.dataTransfer;
+    if (track.locked) return;
+    if (dt.types.includes(ASSET_DND_MIME) || dt.types.includes("Files")) {
+      event.preventDefault();
+      dt.dropEffect = "copy";
+      if (dropTrackId !== track.id) setDropTrackId(track.id);
+    }
+  };
+
+  const onLaneDrop = (event: ReactDragEvent, track: Track) => {
+    if (track.locked) return;
+    const dt = event.dataTransfer;
+    const hasAsset = dt.types.includes(ASSET_DND_MIME);
+    const hasFiles = dt.types.includes("Files");
+    if (!hasAsset && !hasFiles) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setDropTrackId(null);
+    // Read the transfer synchronously — it is cleared after any await.
+    const startFrame = maybeSnap(clientXToFrame(event.clientX));
+    const assetId = hasAsset ? dt.getData(ASSET_DND_MIME) : "";
+    const files = hasFiles ? Array.from(dt.files) : [];
+
+    if (assetId) {
+      const asset = useTimelineStore.getState().project.assets.find((candidate) => candidate.id === assetId);
+      if (asset) insertAssetClip(asset, track, startFrame);
+      return;
+    }
+    void (async () => {
+      const created = await ingestFiles(files, frameRate);
+      let cursor = startFrame;
+      for (const asset of created) {
+        addAsset(asset);
+        insertAssetClip(asset, track, cursor);
+        cursor += asset.durationFrames;
+      }
+    })();
+  };
+
   // -- Transport / keyboard ---------------------------------------------------
 
   const togglePlay = useCallback(() => {
@@ -435,6 +565,9 @@ export const Timeline = () => {
         case "KeyC":
           store.setActiveTool("razor");
           break;
+        case "KeyM":
+          store.addMarker(transport.getFrame());
+          break;
         case "Delete":
         case "Backspace": {
           if (store.selectedItemIds.length > 0) {
@@ -485,6 +618,13 @@ export const Timeline = () => {
           className={`rounded p-1.5 ${snapping ? "bg-accent/25 text-accent" : "text-neutral-400 hover:bg-panel-raised"}`}
         >
           <Magnet size={14} />
+        </button>
+        <button
+          title="Add marker at playhead (M)"
+          onClick={() => addMarker(transport.getFrame())}
+          className="rounded p-1.5 text-neutral-400 hover:bg-panel-raised"
+        >
+          <Bookmark size={14} />
         </button>
 
         <div className="mx-2 h-5 w-px bg-edge" />
@@ -592,14 +732,37 @@ export const Timeline = () => {
                   <span className="absolute left-1 top-2 font-mono text-[9px] text-neutral-500">{tick.label}</span>
                 </div>
               ))}
+              {markers.map((marker) => (
+                <MarkerPin
+                  key={marker.id}
+                  marker={marker}
+                  pixelsPerFrame={pixelsPerFrame}
+                  onSeek={() => transport.setFrame(marker.frame)}
+                  onRemove={() => removeMarker(marker.id)}
+                  onRelabel={(label) => updateMarker(marker.id, { label })}
+                />
+              ))}
             </div>
 
             {/* Lanes */}
-            <div onPointerMove={onLanePointerMove} onPointerUp={onLanePointerUp}>
+            <div className="relative" onPointerMove={onLanePointerMove} onPointerUp={onLanePointerUp}>
+              {/* Marker guide lines spanning all lanes */}
+              {markers.map((marker) => (
+                <div
+                  key={marker.id}
+                  className="pointer-events-none absolute top-0 bottom-0 z-20 w-px"
+                  style={{ left: marker.frame * pixelsPerFrame, background: marker.color, opacity: 0.5 }}
+                />
+              ))}
               {tracks.map((track) => (
                 <div
                   key={track.id}
-                  className="relative border-b border-edge/60 bg-panel-deep odd:bg-[#13151a]"
+                  onDragOver={(event) => onLaneDragOver(event, track)}
+                  onDragLeave={() => setDropTrackId((current) => (current === track.id ? null : current))}
+                  onDrop={(event) => onLaneDrop(event, track)}
+                  className={`relative border-b border-edge/60 bg-panel-deep odd:bg-[#13151a] ${
+                    dropTrackId === track.id ? "bg-accent/10 outline outline-1 -outline-offset-1 outline-accent/70" : ""
+                  }`}
                   style={{ height: track.heightPx }}
                 >
                   {track.items.map((item) => (
