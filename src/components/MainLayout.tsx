@@ -10,6 +10,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  Activity,
   Circle,
   Clapperboard,
   FileAudio,
@@ -17,6 +18,8 @@ import {
   FolderOpen,
   Image as ImageIcon,
   Import,
+  LayoutGrid,
+  List,
   Plus,
   Save,
   SlidersHorizontal,
@@ -27,11 +30,20 @@ import {
 import { VideoPlayer } from "./VideoPlayer";
 import { Timeline } from "./Timeline";
 import { fileSystemService, isUserAbort } from "../services/FileSystemService";
+import {
+  ASSET_DND_MIME,
+  classifyMedia,
+  getThumbnail,
+  ingestFiles,
+  isMediaFile,
+  probeMedia,
+} from "../services/mediaImport";
 import { transport, useTimelineStore } from "../store/timelineStore";
 import {
   ASPECT_PRESETS,
   createId,
   defaultCorridorKeyParams,
+  framesToTimecode,
   identityTransform,
   makeShapeItem,
   makeTextItem,
@@ -57,60 +69,25 @@ type UpdateItemFn = (itemId: TrackItemId, updater: (item: TrackItem) => TrackIte
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
+/** Curated font stacks offered in the text Inspector (all locally available). */
+const FONT_OPTIONS: readonly string[] = [
+  "Inter, system-ui, sans-serif",
+  "Arial, Helvetica, sans-serif",
+  "Georgia, serif",
+  "'Times New Roman', Times, serif",
+  "'Courier New', monospace",
+  "Verdana, Geneva, sans-serif",
+  "'Trebuchet MS', sans-serif",
+  "Impact, Haettenschweiler, sans-serif",
+  "'Comic Sans MS', cursive",
+  "Tahoma, Geneva, sans-serif",
+];
+
+const fontLabel = (stack: string): string => stack.split(",")[0].replace(/['"]/g, "").trim();
+
 // ---------------------------------------------------------------------------
-// Media probing
+// Media pool
 // ---------------------------------------------------------------------------
-
-const VIDEO_EXTENSIONS = /\.(mp4|mov|m4v|webm|mkv|avi|mts|m2ts)$/i;
-const AUDIO_EXTENSIONS = /\.(mp3|wav|aac|flac|ogg|m4a|opus)$/i;
-const IMAGE_EXTENSIONS = /\.(png|jpe?g|webp|gif|avif|bmp)$/i;
-
-/**
- * Windows frequently reports an empty/octet-stream MIME for .mov and other
- * containers, so the extension is the fallback source of truth.
- */
-const classifyMedia = (mimeType: string, fileName: string): MediaKind => {
-  if (mimeType.startsWith("video/")) return "video";
-  if (mimeType.startsWith("audio/")) return "audio";
-  if (mimeType.startsWith("image/")) return "image";
-  if (VIDEO_EXTENSIONS.test(fileName)) return "video";
-  if (AUDIO_EXTENSIONS.test(fileName)) return "audio";
-  if (IMAGE_EXTENSIONS.test(fileName)) return "image";
-  return "video";
-};
-
-/** Probe duration/dimensions via a throwaway media element (metadata only). */
-const probeMedia = (file: File, kind: MediaKind): Promise<{ duration: number; width: number; height: number }> =>
-  new Promise((resolve) => {
-    if (kind === "image") {
-      const img = new Image();
-      const url = URL.createObjectURL(file);
-      img.onload = () => {
-        URL.revokeObjectURL(url);
-        resolve({ duration: 5, width: img.naturalWidth, height: img.naturalHeight });
-      };
-      img.onerror = () => {
-        URL.revokeObjectURL(url);
-        resolve({ duration: 5, width: 0, height: 0 });
-      };
-      img.src = url;
-      return;
-    }
-    const element = document.createElement(kind === "video" ? "video" : "audio");
-    const url = URL.createObjectURL(file);
-    element.preload = "metadata";
-    element.onloadedmetadata = () => {
-      const width = element instanceof HTMLVideoElement ? element.videoWidth : 0;
-      const height = element instanceof HTMLVideoElement ? element.videoHeight : 0;
-      URL.revokeObjectURL(url);
-      resolve({ duration: element.duration || 5, width, height });
-    };
-    element.onerror = () => {
-      URL.revokeObjectURL(url);
-      resolve({ duration: 5, width: 0, height: 0 });
-    };
-    element.src = url;
-  });
 
 const MEDIA_ICONS: Record<MediaKind, typeof FileVideo> = {
   video: FileVideo,
@@ -141,6 +118,93 @@ const InsertButton = ({
 // Media pool (left panel)
 // ---------------------------------------------------------------------------
 
+/** Async, cached poster thumbnail for a media asset. */
+const useThumbnail = (asset: MediaAsset): string | null => {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setUrl(null);
+    void getThumbnail(asset).then((next) => {
+      if (alive) setUrl(next);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [asset]);
+  return url;
+};
+
+const startAssetDrag = (event: React.DragEvent, assetId: MediaAssetId) => {
+  event.dataTransfer.setData(ASSET_DND_MIME, assetId);
+  event.dataTransfer.effectAllowed = "copy";
+};
+
+/** Grid tile: draggable poster + metadata. Drag to timeline, double-click to add. */
+const AssetCard = ({ asset, onAdd }: { asset: MediaAsset; onAdd: () => void }) => {
+  const thumb = useThumbnail(asset);
+  const Icon = MEDIA_ICONS[asset.kind];
+  return (
+    <div
+      draggable
+      onDragStart={(event) => startAssetDrag(event, asset.id)}
+      onDoubleClick={onAdd}
+      title={`${asset.name} — drag to timeline or double-click to add`}
+      className="group relative cursor-grab overflow-hidden rounded border border-edge bg-panel-raised/60 hover:border-accent/60"
+    >
+      <div className="flex aspect-video items-center justify-center bg-black/40">
+        {thumb ? (
+          <img src={thumb} alt="" draggable={false} className="h-full w-full object-cover" />
+        ) : (
+          <Icon size={20} className="text-accent" />
+        )}
+      </div>
+      <div className="px-1.5 py-1">
+        <p className="truncate text-[10px] text-neutral-200">{asset.name}</p>
+        <p className="font-mono text-[8px] text-neutral-500">
+          {(asset.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB
+          {asset.width ? ` · ${asset.width}×${asset.height}` : ""}
+        </p>
+      </div>
+      <button
+        title="Add to timeline"
+        onClick={onAdd}
+        className="absolute right-1 top-1 rounded bg-black/60 p-1 text-neutral-300 opacity-0 hover:text-accent group-hover:opacity-100"
+      >
+        <Plus size={12} />
+      </button>
+    </div>
+  );
+};
+
+/** List row: compact draggable entry. */
+const AssetRow = ({ asset, onAdd }: { asset: MediaAsset; onAdd: () => void }) => {
+  const Icon = MEDIA_ICONS[asset.kind];
+  return (
+    <div
+      draggable
+      onDragStart={(event) => startAssetDrag(event, asset.id)}
+      onDoubleClick={onAdd}
+      className="group mb-1 flex cursor-grab items-center gap-2 rounded border border-transparent bg-panel-raised/60 px-2 py-1.5 hover:border-edge"
+    >
+      <Icon size={14} className="shrink-0 text-accent" />
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-[11px] text-neutral-200">{asset.name}</p>
+        <p className="font-mono text-[9px] text-neutral-500">
+          {(asset.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB
+          {asset.width ? ` · ${asset.width}×${asset.height}` : ""}
+        </p>
+      </div>
+      <button
+        title="Add to timeline"
+        onClick={onAdd}
+        className="rounded p-1 text-neutral-500 opacity-0 hover:bg-panel hover:text-accent group-hover:opacity-100"
+      >
+        <Plus size={13} />
+      </button>
+    </div>
+  );
+};
+
 const MediaPool = () => {
   const assets = useTimelineStore((state) => state.project.assets);
   const tracks = useTimelineStore((state) => state.project.tracks);
@@ -150,6 +214,23 @@ const MediaPool = () => {
   const addItemToTrack = useTimelineStore((state) => state.addItemToTrack);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [grid, setGrid] = useState(true);
+  const [dropActive, setDropActive] = useState(false);
+
+  const importFileList = useCallback(
+    async (files: readonly File[]) => {
+      const media = files.filter(isMediaFile);
+      if (media.length === 0) return;
+      setError(null);
+      try {
+        const created = await ingestFiles(media, frameRate);
+        for (const asset of created) addAsset(asset);
+      } catch (dropError) {
+        setError(dropError instanceof Error ? dropError.message : String(dropError));
+      }
+    },
+    [addAsset, frameRate],
+  );
 
   const insertOverlay = useCallback(
     (factory: (start: number, duration: number) => Omit<TrackItem, "id">) => {
@@ -252,38 +333,61 @@ const MediaPool = () => {
             onClick={() => insertOverlay((s, d) => makeShapeItem("ellipse", s, d))}
           />
         </div>
+        <div className="mt-2 flex items-center justify-between">
+          <span className="text-[9px] uppercase tracking-wide text-neutral-600">
+            {assets.length} item{assets.length === 1 ? "" : "s"}
+          </span>
+          <div className="flex gap-0.5">
+            <button
+              title="Grid view"
+              onClick={() => setGrid(true)}
+              className={`rounded p-1 ${grid ? "bg-accent/25 text-accent" : "text-neutral-500 hover:bg-panel-raised"}`}
+            >
+              <LayoutGrid size={12} />
+            </button>
+            <button
+              title="List view"
+              onClick={() => setGrid(false)}
+              className={`rounded p-1 ${!grid ? "bg-accent/25 text-accent" : "text-neutral-500 hover:bg-panel-raised"}`}
+            >
+              <List size={12} />
+            </button>
+          </div>
+        </div>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+      <div
+        onDragOver={(event) => {
+          if (event.dataTransfer.types.includes("Files")) {
+            event.preventDefault();
+            setDropActive(true);
+          }
+        }}
+        onDragLeave={() => setDropActive(false)}
+        onDrop={(event) => {
+          if (!event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          event.stopPropagation();
+          setDropActive(false);
+          void importFileList(Array.from(event.dataTransfer.files));
+        }}
+        className={`min-h-0 flex-1 overflow-y-auto px-2 pb-2 ${
+          dropActive ? "bg-accent/5 ring-1 ring-inset ring-accent/40" : ""
+        }`}
+      >
         {assets.length === 0 && (
           <p className="px-1 pt-4 text-center text-[11px] leading-relaxed text-neutral-600">
-            No media yet. Files stream straight from your disk — nothing is uploaded.
+            No media yet. Import, paste, or drop files here — nothing is uploaded.
           </p>
         )}
-        {assets.map((asset) => {
-          const Icon = MEDIA_ICONS[asset.kind];
-          return (
-            <div
-              key={asset.id}
-              className="group mb-1 flex items-center gap-2 rounded border border-transparent bg-panel-raised/60 px-2 py-1.5 hover:border-edge"
-            >
-              <Icon size={14} className="shrink-0 text-accent" />
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-[11px] text-neutral-200">{asset.name}</p>
-                <p className="font-mono text-[9px] text-neutral-500">
-                  {(asset.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB
-                  {asset.width ? ` · ${asset.width}×${asset.height}` : ""}
-                </p>
-              </div>
-              <button
-                title="Add to timeline"
-                onClick={() => handleAddToTimeline(asset)}
-                className="rounded p-1 text-neutral-500 opacity-0 hover:bg-panel hover:text-accent group-hover:opacity-100"
-              >
-                <Plus size={13} />
-              </button>
-            </div>
-          );
-        })}
+        {grid ? (
+          <div className="grid grid-cols-2 gap-1.5">
+            {assets.map((asset) => (
+              <AssetCard key={asset.id} asset={asset} onAdd={() => handleAddToTimeline(asset)} />
+            ))}
+          </div>
+        ) : (
+          assets.map((asset) => <AssetRow key={asset.id} asset={asset} onAdd={() => handleAddToTimeline(asset)} />)
+        )}
       </div>
     </div>
   );
@@ -426,6 +530,24 @@ const TextSection = ({ item, updateItem }: { item: TrackItem; updateItem: Update
         onChange={(event) => set({ text: event.target.value })}
         className="mb-2 w-full resize-none rounded border border-edge bg-panel-raised px-2 py-1 text-[11px] text-neutral-200 outline-none focus:border-accent/60"
       />
+      <label className="mb-2 block">
+        <span className="mb-0.5 block text-[9px] uppercase tracking-wide text-neutral-500">Font</span>
+        <select
+          value={item.fontFamily}
+          onChange={(event) => set({ fontFamily: event.target.value })}
+          style={{ fontFamily: item.fontFamily }}
+          className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200"
+        >
+          {!FONT_OPTIONS.includes(item.fontFamily) && (
+            <option value={item.fontFamily}>{fontLabel(item.fontFamily)}</option>
+          )}
+          {FONT_OPTIONS.map((stack) => (
+            <option key={stack} value={stack} style={{ fontFamily: stack }}>
+              {fontLabel(stack)}
+            </option>
+          ))}
+        </select>
+      </label>
       <div className="grid grid-cols-2 gap-2">
         <NumberField label="Size" value={item.fontSizePx} onChange={(v) => set({ fontSizePx: Math.max(1, v) })} />
         <label className="block">
@@ -748,6 +870,77 @@ const PanelTitle = ({ icon, title }: { icon: React.ReactNode; title: string }) =
 );
 
 // ---------------------------------------------------------------------------
+// Diagnostics panel
+// ---------------------------------------------------------------------------
+
+const DiagRow = ({ label, value, ok }: { label: string; value: string; ok?: boolean }) => (
+  <div className="flex items-center justify-between border-b border-edge/50 py-1.5 text-[11px]">
+    <span className="text-neutral-400">{label}</span>
+    <span className={`font-mono ${ok === undefined ? "text-neutral-200" : ok ? "text-emerald-400" : "text-amber-400"}`}>
+      {value}
+    </span>
+  </div>
+);
+
+const DiagnosticsPanel = ({ onClose }: { onClose: () => void }) => {
+  const project = useTimelineStore((state) => state.project);
+  const stats = useMemo(() => {
+    let items = 0;
+    let durationFrames = 0;
+    for (const track of project.tracks) {
+      items += track.items.length;
+      for (const item of track.items) durationFrames = Math.max(durationFrames, item.startFrame + item.durationFrames);
+    }
+    return { items, durationFrames };
+  }, [project]);
+
+  const secure = typeof window !== "undefined" && window.isSecureContext;
+  const coi = typeof window !== "undefined" && window.crossOriginIsolated;
+  const webgpu = typeof navigator !== "undefined" && "gpu" in navigator;
+  const canDecode = typeof window !== "undefined" && "VideoDecoder" in window;
+  const canEncode = typeof window !== "undefined" && "VideoEncoder" in window;
+  const canFsa = typeof window !== "undefined" && "showOpenFilePicker" in window;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+      <div
+        className="w-full max-w-md rounded-lg border border-edge bg-panel p-4 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center gap-2">
+          <Activity size={14} className="text-accent" />
+          <span className="text-xs font-semibold tracking-wide text-neutral-200">DIAGNOSTICS</span>
+          <div className="flex-1" />
+          <button onClick={onClose} className="rounded px-2 py-0.5 text-[11px] text-neutral-400 hover:bg-panel-raised">
+            Close
+          </button>
+        </div>
+
+        <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Environment</p>
+        <DiagRow label="WebGPU" value={webgpu ? "available" : "unavailable"} ok={webgpu} />
+        <DiagRow label="WebCodecs decode" value={canDecode ? "available" : "unavailable"} ok={canDecode} />
+        <DiagRow label="WebCodecs encode" value={canEncode ? "available" : "unavailable"} ok={canEncode} />
+        <DiagRow label="File System Access" value={canFsa ? "available" : "unavailable"} ok={canFsa} />
+        <DiagRow label="Secure context" value={secure ? "yes" : "no"} ok={secure} />
+        <DiagRow label="Cross-origin isolated" value={coi ? "yes (threads)" : "no (single-thread)"} ok={coi} />
+
+        <p className="mb-1 mt-3 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Project</p>
+        <DiagRow label="Resolution" value={`${project.settings.width}×${project.settings.height}`} />
+        <DiagRow label="Frame rate" value={`${project.settings.frameRate} fps`} />
+        <DiagRow label="Tracks" value={String(project.tracks.length)} />
+        <DiagRow label="Timeline items" value={String(stats.items)} />
+        <DiagRow label="Media assets" value={String(project.assets.length)} />
+        <DiagRow label="Markers" value={String(project.markers.length)} />
+        <DiagRow
+          label="Content length"
+          value={framesToTimecode(stats.durationFrames, project.settings.frameRate)}
+        />
+      </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Main layout
 // ---------------------------------------------------------------------------
 
@@ -757,47 +950,51 @@ export const MainLayout = () => {
   const addAsset = useTimelineStore((state) => state.addAsset);
   const frameRate = useTimelineStore((state) => state.project.settings.frameRate);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [showDiag, setShowDiag] = useState(false);
 
   // Paste-to-import: media files on the clipboard become assets (no picker).
   useEffect(() => {
-    const onPaste = async (event: ClipboardEvent) => {
-      const target = event.target;
-      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
-      const dropped = event.clipboardData?.files;
-      if (!dropped || dropped.length === 0) return;
-      const files = Array.from(dropped).filter(
-        (file) =>
-          /^(video|audio|image)\//.test(file.type) ||
-          /\.(mp4|mov|m4v|webm|mkv|mp3|wav|aac|flac|ogg|m4a|png|jpe?g|gif|webp|avif)$/i.test(file.name),
-      );
-      if (files.length === 0) return;
-      event.preventDefault();
-      for (const file of files) {
-        try {
-          const handleKey = await fileSystemService.registerBlobFile(file);
-          const kind = classifyMedia(file.type || "", file.name);
-          const probed = await probeMedia(file, kind);
-          addAsset({
-            id: createId<MediaAssetId>(),
-            kind,
-            name: file.name || `Pasted ${kind}`,
-            handleKey,
-            durationFrames: Math.max(1, Math.round(probed.duration * frameRate)),
-            width: probed.width || undefined,
-            height: probed.height || undefined,
-            frameRate: undefined,
-            mimeType: file.type || "application/octet-stream",
-            fileSizeBytes: file.size,
-          });
-          setStatusMessage(`Imported ${file.name || "pasted media"}`);
-          window.setTimeout(() => setStatusMessage(null), 2500);
-        } catch (error) {
-          setStatusMessage(error instanceof Error ? error.message : String(error));
-        }
+    const importFiles = async (files: File[], label: string) => {
+      const media = files.filter(isMediaFile);
+      if (media.length === 0) return;
+      try {
+        const created = await ingestFiles(media, frameRate);
+        for (const asset of created) addAsset(asset);
+        setStatusMessage(`Imported ${created.length} ${label}`);
+        window.setTimeout(() => setStatusMessage(null), 2500);
+      } catch (error) {
+        setStatusMessage(error instanceof Error ? error.message : String(error));
       }
     };
+
+    const onPaste = (event: ClipboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
+      const files = event.clipboardData?.files;
+      if (!files || files.length === 0) return;
+      event.preventDefault();
+      void importFiles(Array.from(files), "pasted file(s)");
+    };
+
+    // Stop the browser navigating to a dropped file, and import files dropped
+    // anywhere the media pool / timeline drop zones didn't already consume.
+    const onDragOver = (event: DragEvent) => {
+      if (event.dataTransfer?.types.includes("Files")) event.preventDefault();
+    };
+    const onDrop = (event: DragEvent) => {
+      if (!event.dataTransfer?.types.includes("Files")) return;
+      event.preventDefault();
+      void importFiles(Array.from(event.dataTransfer.files), "dropped file(s)");
+    };
+
     window.addEventListener("paste", onPaste);
-    return () => window.removeEventListener("paste", onPaste);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("paste", onPaste);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("drop", onDrop);
+    };
   }, [addAsset, frameRate]);
 
   const withStatus = useCallback(async (label: string, action: () => Promise<void>) => {
@@ -841,6 +1038,13 @@ export const MainLayout = () => {
         {statusMessage && <span className="text-[11px] text-accent">{statusMessage}</span>}
 
         <button
+          onClick={() => setShowDiag(true)}
+          title="Diagnostics"
+          className="flex items-center gap-1.5 rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60"
+        >
+          <Activity size={12} />
+        </button>
+        <button
           onClick={handleOpen}
           className="flex items-center gap-1.5 rounded border border-edge px-2.5 py-1 text-[11px] text-neutral-300 hover:border-accent/60"
         >
@@ -871,6 +1075,8 @@ export const MainLayout = () => {
       <div className="min-h-0 flex-[2]">
         <Timeline />
       </div>
+
+      {showDiag && <DiagnosticsPanel onClose={() => setShowDiag(false)} />}
     </div>
   );
 };
