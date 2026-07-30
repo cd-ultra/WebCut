@@ -21,6 +21,7 @@ import {
   sampleAnimatable,
   type BlendMode,
   type ClipItem,
+  type ColorGrade,
   type CorridorKeyParams,
   type GradientFill,
   type MediaAsset,
@@ -46,6 +47,7 @@ export interface FrameSink {
   ingestLayerFrame(layerId: string, frame: VideoFrame | HTMLVideoElement | ImageBitmap, order: number): void;
   setLayerEffect(layerId: string, enabled: boolean, params: CorridorKeyParams): void;
   setLayerBlend(layerId: string, mode: BlendMode): void;
+  setLayerGrade(layerId: string, grade: ColorGrade | null): void;
   /** Reconcile live layers; anything absent from the list is destroyed. */
   syncLayers(activeLayerIds: readonly string[]): void;
 }
@@ -256,6 +258,7 @@ class PreviewService {
       const key = corridorKeyOf(clip);
       sink.setLayerEffect(trackId, key.enabled, key.params);
       sink.setLayerBlend(trackId, clip.blendMode ?? "normal");
+      sink.setLayerGrade(trackId, clip.grade ?? null);
 
       if (asset.kind === "image") {
         const bitmap = await this.getImageBitmap(asset);

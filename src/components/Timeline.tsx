@@ -111,6 +111,11 @@ interface DragState {
   readonly originClientX: number;
   readonly originStartFrame: number;
   readonly originDurationFrames: number;
+  /** Modifier keys captured at drag start select the trim behavior. */
+  readonly alt: boolean;
+  readonly shift: boolean;
+  /** Cumulative whole-frame delta already applied (for incremental slip/slide/roll). */
+  appliedFrames: number;
 }
 
 const ITEM_COLORS: Record<TrackItem["type"], string> = {
@@ -312,6 +317,9 @@ export const Timeline = () => {
   const moveItem = useTimelineStore((state) => state.moveItem);
   const trimItem = useTimelineStore((state) => state.trimItem);
   const trimItemRipple = useTimelineStore((state) => state.trimItemRipple);
+  const slipItem = useTimelineStore((state) => state.slipItem);
+  const rollItem = useTimelineStore((state) => state.rollItem);
+  const slideItem = useTimelineStore((state) => state.slideItem);
   const assets = useTimelineStore((state) => state.project.assets);
   const splitItemAtFrame = useTimelineStore((state) => state.splitItemAtFrame);
   const setSelection = useTimelineStore((state) => state.setSelection);
@@ -447,6 +455,9 @@ export const Timeline = () => {
       originClientX: event.clientX,
       originStartFrame: item.startFrame,
       originDurationFrames: item.durationFrames,
+      alt: event.altKey,
+      shift: event.shiftKey,
+      appliedFrames: 0,
     };
   };
 
@@ -455,12 +466,24 @@ export const Timeline = () => {
     if (!drag) return;
     const deltaFrames = (event.clientX - drag.originClientX) / pixelsPerFrame;
 
+    // Modifier-driven pro trims apply incremental whole-frame deltas.
+    const applyIncremental = (action: (id: TrackItemId, delta: number) => void) => {
+      const wanted = Math.round(deltaFrames);
+      const inc = wanted - drag.appliedFrames;
+      if (inc !== 0) {
+        action(drag.itemId, inc);
+        drag.appliedFrames = wanted;
+      }
+    };
+
     if (drag.mode === "move") {
+      if (drag.alt) return applyIncremental(slideItem); // Alt+drag = slide
+      if (drag.shift) return applyIncremental(slipItem); // Shift+drag = slip
       const targetStart = maybeSnap(drag.originStartFrame + deltaFrames);
       const currentItem = findItem(tracks, drag.itemId);
-      if (currentItem) {
-        moveItem(drag.itemId, targetStart - currentItem.startFrame);
-      }
+      if (currentItem) moveItem(drag.itemId, targetStart - currentItem.startFrame);
+    } else if (drag.mode === "trim-end" && drag.alt) {
+      applyIncremental(rollItem); // Alt+trim-end = roll the shared edit point
     } else if (drag.mode === "trim-start") {
       const trim = ripple ? trimItemRipple : trimItem;
       trim(drag.itemId, "start", maybeSnap(drag.originStartFrame + deltaFrames));
@@ -609,6 +632,24 @@ export const Timeline = () => {
           break;
         case "KeyM":
           store.addMarker(transport.getFrame());
+          break;
+        case "KeyL": {
+          // Shuttle forward; repeated presses accelerate (1×, 2×, 4×…).
+          const r = transport.getRate();
+          transport.setRate(r > 0 ? Math.min(16, r * 2) : 1);
+          setIsPlaying(true);
+          break;
+        }
+        case "KeyJ": {
+          // Shuttle in reverse; repeated presses accelerate backward.
+          const r = transport.getRate();
+          transport.setRate(r < 0 ? Math.max(-16, r * 2) : -1);
+          setIsPlaying(true);
+          break;
+        }
+        case "KeyK":
+          transport.setRate(0);
+          setIsPlaying(false);
           break;
         case "Delete":
         case "Backspace": {

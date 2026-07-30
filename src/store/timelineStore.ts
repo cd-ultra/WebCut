@@ -60,11 +60,16 @@ export interface Transport {
   play(): void;
   pause(): void;
   togglePlayback(): void;
+  /** Current shuttle rate (1 = realtime forward; negative = reverse; 0 = stopped). */
+  getRate(): number;
+  /** J/K/L-style shuttle: set a signed playback-rate multiplier (0 stops). */
+  setRate(rate: number): void;
 }
 
 const createTransport = (getFps: () => number, getDuration: () => number): Transport => {
   let currentFrame = 0;
   let playing = false;
+  let rate = 1;
   let rafHandle = 0;
   let playStartTimestamp = 0;
   let playStartFrame = 0;
@@ -77,10 +82,16 @@ const createTransport = (getFps: () => number, getDuration: () => number): Trans
   const tick = (timestamp: number) => {
     if (!playing) return;
     const elapsedSeconds = (timestamp - playStartTimestamp) / 1000;
-    const nextFrame = playStartFrame + elapsedSeconds * getFps();
+    const nextFrame = playStartFrame + elapsedSeconds * getFps() * rate;
     const duration = getDuration();
-    if (duration > 0 && nextFrame >= duration) {
+    if (rate > 0 && duration > 0 && nextFrame >= duration) {
       currentFrame = duration;
+      playing = false;
+      notify();
+      return;
+    }
+    if (rate < 0 && nextFrame <= 0) {
+      currentFrame = 0;
       playing = false;
       notify();
       return;
@@ -108,14 +119,17 @@ const createTransport = (getFps: () => number, getDuration: () => number): Trans
     },
     isPlaying: () => playing,
     play: () => {
-      if (playing) return;
+      if (playing && rate === 1) return;
+      rate = 1;
       playing = true;
       playStartFrame = currentFrame;
       playStartTimestamp = performance.now();
+      cancelAnimationFrame(rafHandle);
       rafHandle = requestAnimationFrame(tick);
     },
     pause: () => {
       playing = false;
+      rate = 1;
       cancelAnimationFrame(rafHandle);
       currentFrame = Math.round(currentFrame);
       notify();
@@ -123,6 +137,25 @@ const createTransport = (getFps: () => number, getDuration: () => number): Trans
     togglePlayback() {
       if (playing) this.pause();
       else this.play();
+    },
+    getRate: () => (playing ? rate : 0),
+    setRate: (nextRate: number) => {
+      if (nextRate === 0) {
+        playing = false;
+        rate = 1;
+        cancelAnimationFrame(rafHandle);
+        currentFrame = Math.round(currentFrame);
+        notify();
+        return;
+      }
+      rate = nextRate;
+      playStartFrame = currentFrame;
+      playStartTimestamp = performance.now();
+      if (!playing) {
+        playing = true;
+      }
+      cancelAnimationFrame(rafHandle);
+      rafHandle = requestAnimationFrame(tick);
     },
   };
 };
@@ -199,6 +232,10 @@ export interface TimelineState {
   clearTransformKeyframes(itemId: TrackItemId, prop: TransformProp, localFrame: number): void;
   // ripple trim
   trimItemRipple(itemId: TrackItemId, edge: "start" | "end", newFrame: number): void;
+  // professional trim tools
+  slipItem(itemId: TrackItemId, deltaFrames: number): void;
+  rollItem(itemId: TrackItemId, deltaFrames: number): void;
+  slideItem(itemId: TrackItemId, deltaFrames: number): void;
   // clipboard + history
   copySelection(): void;
   cutSelection(): void;
@@ -740,6 +777,83 @@ export const useTimelineStore = create<TimelineState>()(
         };
         return { project, revision: state.revision + 1, ...pushPastCoalesced(state, "trim") };
       }),
+
+    // Slip: shift a clip's source in-point without moving it on the timeline.
+    slipItem: (itemId, deltaFrames) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) =>
+          item.id === itemId && item.type === "clip"
+            ? { ...item, sourceInFrame: Math.max(0, item.sourceInFrame - Math.round(deltaFrames)) }
+            : item,
+        ),
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, "slip"),
+      })),
+
+    // Roll: move the shared edit point between a clip and its adjacent neighbor.
+    rollItem: (itemId, deltaFrames) =>
+      set((state) => ({
+        project: {
+          ...state.project,
+          tracks: state.project.tracks.map((track) => {
+            const item = track.items.find((i) => i.id === itemId);
+            if (!item) return track;
+            const itemEnd = item.startFrame + item.durationFrames;
+            const next = track.items.find((i) => i.id !== itemId && i.startFrame === itemEnd);
+            const maxD = next ? next.durationFrames - 1 : item.durationFrames * 4;
+            const minD = -(item.durationFrames - 1);
+            const d = Math.max(minD, Math.min(maxD, Math.round(deltaFrames)));
+            return {
+              ...track,
+              items: track.items.map((i) => {
+                if (i.id === itemId) return { ...i, durationFrames: i.durationFrames + d };
+                if (next && i.id === next.id) {
+                  const rolled = { ...i, startFrame: i.startFrame + d, durationFrames: i.durationFrames - d };
+                  return rolled.type === "clip"
+                    ? { ...rolled, sourceInFrame: Math.max(0, rolled.sourceInFrame + d) }
+                    : rolled;
+                }
+                return i;
+              }),
+            };
+          }),
+        },
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, "roll"),
+      })),
+
+    // Slide: move a clip between its neighbors, resizing them to keep the layout.
+    slideItem: (itemId, deltaFrames) =>
+      set((state) => ({
+        project: {
+          ...state.project,
+          tracks: state.project.tracks.map((track) => {
+            const item = track.items.find((i) => i.id === itemId);
+            if (!item) return track;
+            const start = item.startFrame;
+            const end = start + item.durationFrames;
+            const prev = track.items.find((i) => i.id !== itemId && i.startFrame + i.durationFrames === start);
+            const next = track.items.find((i) => i.id !== itemId && i.startFrame === end);
+            const minD = prev ? -(prev.durationFrames - 1) : -start;
+            const maxD = next ? next.durationFrames - 1 : item.durationFrames * 4;
+            const d = Math.max(minD, Math.min(maxD, Math.round(deltaFrames)));
+            return {
+              ...track,
+              items: track.items.map((i) => {
+                if (i.id === itemId) return { ...i, startFrame: i.startFrame + d };
+                if (prev && i.id === prev.id) return { ...i, durationFrames: i.durationFrames + d };
+                if (next && i.id === next.id) {
+                  const slid = { ...i, startFrame: i.startFrame + d, durationFrames: i.durationFrames - d };
+                  return slid.type === "clip" ? { ...slid, sourceInFrame: Math.max(0, slid.sourceInFrame + d) } : slid;
+                }
+                return i;
+              }),
+            };
+          }),
+        },
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, "slide"),
+      })),
 
     toggleTrackFlag: (trackId, flag) =>
       set((state) => ({

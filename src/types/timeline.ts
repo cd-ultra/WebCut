@@ -119,6 +119,46 @@ export const defaultCorridorKeyParams = (): CorridorKeyParams => ({
   useNeuralMatte: false,
 });
 
+// ---------------------------------------------------------------------------
+// Color grade (primary correction applied in the compositor after keying)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-clip primary grade. Lift/gamma/gain follow an ASC-CDL-style pipeline
+ * (out = pow(clamp(in*gain + lift), 1/gamma)), followed by brightness/contrast,
+ * saturation, and a simple temperature/tint white balance. All fields default
+ * to identity (no visual change).
+ */
+export interface ColorGrade {
+  readonly lift: readonly [number, number, number];
+  readonly gamma: readonly [number, number, number];
+  readonly gain: readonly [number, number, number];
+  readonly brightness: number;
+  readonly contrast: number;
+  readonly saturation: number;
+  readonly temperature: number;
+  readonly tint: number;
+}
+
+export const identityGrade = (): ColorGrade => ({
+  lift: [0, 0, 0],
+  gamma: [1, 1, 1],
+  gain: [1, 1, 1],
+  brightness: 0,
+  contrast: 1,
+  saturation: 1,
+  temperature: 0,
+  tint: 0,
+});
+
+/** True when a grade would produce no visual change (lets the shader skip it). */
+export const isIdentityGrade = (g: ColorGrade): boolean =>
+  g.lift[0] === 0 && g.lift[1] === 0 && g.lift[2] === 0 &&
+  g.gamma[0] === 1 && g.gamma[1] === 1 && g.gamma[2] === 1 &&
+  g.gain[0] === 1 && g.gain[1] === 1 && g.gain[2] === 1 &&
+  g.brightness === 0 && g.contrast === 1 && g.saturation === 1 &&
+  g.temperature === 0 && g.tint === 0;
+
 export type Effect =
   | {
       readonly id: EffectId;
@@ -220,6 +260,8 @@ export interface ClipItem extends TrackItemBase {
   readonly speed: number;
   readonly audioGainDb: number;
   readonly audioMuted: boolean;
+  /** Primary color grade; absent ⇒ identity (no correction). */
+  readonly grade?: ColorGrade;
 }
 
 export interface ShapeItem extends TrackItemBase {
