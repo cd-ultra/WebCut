@@ -24,10 +24,15 @@ import { AlertTriangle, Gauge, Loader2, Maximize2, RotateCw, ZoomIn, ZoomOut } f
 import {
   CORRIDOR_KEY_UNIFORM_SIZE,
   createCorridorKeyPass,
+  createCurveLutTexture,
+  createLut3dTexture,
   NeuralMatteStreamer,
   packCorridorKeyUniforms,
+  writeCurveLutTexture,
+  writeLut3dTexture,
   type CorridorKeyPassResources,
 } from "../effects/CorridorKeyShader";
+import { bakeCurveLut, curvesNeedLut, getLut } from "../effects/lut";
 import { previewService } from "../services/PreviewService";
 import { transport, useTimelineStore } from "../store/timelineStore";
 import {
@@ -111,6 +116,9 @@ class WebGPUCompositor {
         hasFrame: false,
         blendMode: "normal",
         grade: null,
+        curveLutTexture: null,
+        lut3dTexture: null,
+        lut3dSize: 2,
       };
       this.layers.set(layerId, layer);
     }
@@ -127,7 +135,39 @@ class WebGPUCompositor {
   setLayerGrade(layerId: string, grade: ColorGrade | null): void {
     if (this.destroyed) return;
     const layer = this.ensureLayer(layerId, this.layers.get(layerId)?.order ?? 0);
+    // Grade objects are immutable in the store, so reference equality is a
+    // reliable "unchanged" signal — skip the (potentially per-frame) LUT rebuild.
+    if (layer.grade === grade) return;
     layer.grade = grade;
+    this.rebuildLayerLuts(layer, grade);
+  }
+
+  /** Bake/upload the per-layer tone-curve + 3D LUT textures for a grade. */
+  private rebuildLayerLuts(layer: LayerState, grade: ColorGrade | null): void {
+    // Tone curves → 256×1 LUT (only when non-identity).
+    if (grade && curvesNeedLut(grade.curves)) {
+      if (!layer.curveLutTexture) layer.curveLutTexture = createCurveLutTexture(this.device);
+      writeCurveLutTexture(this.device, layer.curveLutTexture, bakeCurveLut(grade.curves!));
+    } else if (layer.curveLutTexture) {
+      layer.curveLutTexture.destroy();
+      layer.curveLutTexture = null;
+    }
+
+    // 3D LUT → volume texture, resolved from the session registry by id.
+    const entry = grade?.lut3dId ? getLut(grade.lut3dId) : undefined;
+    if (entry) {
+      const { size, data } = entry.lut;
+      if (!layer.lut3dTexture || layer.lut3dSize !== size) {
+        layer.lut3dTexture?.destroy();
+        layer.lut3dTexture = createLut3dTexture(this.device, size);
+        layer.lut3dSize = size;
+      }
+      writeLut3dTexture(this.device, layer.lut3dTexture, size, data);
+    } else if (layer.lut3dTexture) {
+      layer.lut3dTexture.destroy();
+      layer.lut3dTexture = null;
+      layer.lut3dSize = 2;
+    }
   }
 
   /** Drop layers whose tracks no longer have a clip under the playhead. */
@@ -138,6 +178,8 @@ class WebGPUCompositor {
       if (!keep.has(id)) {
         layer.texture?.destroy();
         layer.uniformBuffer.destroy();
+        layer.curveLutTexture?.destroy();
+        layer.lut3dTexture?.destroy();
         this.layers.delete(id);
       }
     }
@@ -215,6 +257,7 @@ class WebGPUCompositor {
           layer.width,
           layer.height,
           layer.grade,
+          layer.lut3dSize,
         ),
       );
     }
@@ -249,6 +292,14 @@ class WebGPUCompositor {
                 ? this.matteStreamer.view
                 : this.keyPass.fallbackMatteTexture.createView(),
             },
+            {
+              binding: 4,
+              resource: (layer.curveLutTexture ?? this.keyPass.fallbackCurveLut).createView(),
+            },
+            {
+              binding: 5,
+              resource: (layer.lut3dTexture ?? this.keyPass.fallbackLut3d).createView(),
+            },
           ],
         });
         pass.setBindGroup(1, bindGroup);
@@ -265,6 +316,8 @@ class WebGPUCompositor {
     for (const layer of this.layers.values()) {
       layer.texture?.destroy();
       layer.uniformBuffer.destroy();
+      layer.curveLutTexture?.destroy();
+      layer.lut3dTexture?.destroy();
     }
     this.layers.clear();
     this.keyPass.destroy();
@@ -283,6 +336,12 @@ interface LayerState {
   hasFrame: boolean;
   blendMode: BlendMode;
   grade: ColorGrade | null;
+  /** Baked per-channel tone-curve LUT (256×1), or null when identity. */
+  curveLutTexture: GPUTexture | null;
+  /** Applied 3D LUT volume texture, or null when none. */
+  lut3dTexture: GPUTexture | null;
+  /** Edge length of the current 3D LUT (for shader half-texel correction). */
+  lut3dSize: number;
 }
 
 // ---------------------------------------------------------------------------

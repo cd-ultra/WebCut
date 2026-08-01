@@ -20,6 +20,7 @@ import {
   FolderOpen,
   Image as ImageIcon,
   Import,
+  Keyboard,
   LayoutDashboard,
   LayoutGrid,
   List,
@@ -61,6 +62,13 @@ import {
   makeTextItem,
   sampleAnimatable,
   staticValue,
+  identityCurves,
+  identityHsl,
+  isIdentityCurves,
+  type CurvePoint,
+  type GradeCurves,
+  type GradePreset,
+  type HslQualifier,
   type BezierHandles,
   type BlendMode,
   type ClipItem,
@@ -76,12 +84,24 @@ import {
   type MediaKind,
   type ShapeItem,
   type TextItem,
+  type Track,
   type TrackItem,
   type TrackItemId,
   type Transform,
   type Vec2,
 } from "../types/timeline";
 import type { TransformProp } from "../store/timelineStore";
+import { chordFromEvent, COMMANDS, prettyChord, resetBindings, setBinding, useKeymap, type CommandId } from "../store/keymap";
+import { evalCurve, parseCubeLut, registerLut } from "../effects/lut";
+import { getWaveform } from "../services/waveform";
+import {
+  computeDuckingKeyframes,
+  decodeAudio,
+  defaultDuckOptions,
+  gainToTargetLufs,
+  LUFS_TARGETS,
+  measureLoudness,
+} from "../services/loudness";
 
 /** Signature of the store's generic item updater, shared by Inspector sections. */
 type UpdateItemFn = (itemId: TrackItemId, updater: (item: TrackItem) => TrackItem, coalesceKey?: string) => void;
@@ -886,6 +906,57 @@ const ClipSection = ({ item, updateItem }: { item: TrackItem; updateItem: Update
   );
 };
 
+// ---------------------------------------------------------------------------
+// Retime: speed ramp (#52) + freeze frame (#55)
+// ---------------------------------------------------------------------------
+
+const SpeedSection = ({ item }: { item: TrackItem }) => {
+  const setSpeedRampPoint = useTimelineStore((s) => s.setSpeedRampPoint);
+  const clearSpeedRamp = useTimelineStore((s) => s.clearSpeedRamp);
+  const freezeFrame = useTimelineStore((s) => s.freezeFrame);
+  const fps = useTimelineStore((s) => s.project.settings.frameRate);
+  if (item.type !== "clip") return null;
+  const clip = item;
+  const rampOn = !!clip.speedRamp && clip.speedRamp.kind === "animated";
+  const localPlayhead = Math.round(transport.getFrame()) - clip.startFrame;
+  const withinClip = localPlayhead >= 0 && localPlayhead < clip.durationFrames;
+
+  return (
+    <Section title="Retime">
+      <div className="flex items-center justify-between text-[10px] text-neutral-400">
+        <span>Speed ramp {rampOn ? "· on" : "· off"}</span>
+        {rampOn && (
+          <button onClick={() => clearSpeedRamp(clip.id)} className="rounded border border-edge px-1.5 py-0.5 text-[9px] hover:border-red-500/60">
+            Clear
+          </button>
+        )}
+      </div>
+      <p className="mb-1 text-[9px] leading-tight text-neutral-600">
+        Sets a speed keyframe at the playhead — build a ramp by adding several.
+      </p>
+      <div className="flex flex-wrap gap-1">
+        {[0.25, 0.5, 1, 2, 4].map((sp) => (
+          <button
+            key={sp}
+            disabled={!withinClip}
+            onClick={() => setSpeedRampPoint(clip.id, localPlayhead, sp)}
+            className="rounded border border-edge px-1.5 py-0.5 text-[10px] text-neutral-300 hover:border-accent/60 disabled:opacity-40"
+          >
+            {sp}×
+          </button>
+        ))}
+      </div>
+      <button
+        disabled={!withinClip}
+        onClick={() => freezeFrame(clip.id, Math.round(transport.getFrame()), fps)}
+        className="mt-1.5 w-full rounded border border-edge px-2 py-0.5 text-[10px] text-neutral-300 hover:border-accent/60 disabled:opacity-40"
+      >
+        Freeze frame here (1s hold)
+      </button>
+    </Section>
+  );
+};
+
 /** RGB triple of sliders for one lift/gamma/gain wheel channel. */
 const GradeTriple = ({
   label,
@@ -940,11 +1011,179 @@ const GradeTriple = ({
   );
 };
 
+// ---------------------------------------------------------------------------
+// Tone-curve editor (#42) — draggable control points on an SVG grid
+// ---------------------------------------------------------------------------
+
+const CURVE_CHANNELS = [
+  { key: "master" as const, label: "RGB", stroke: "#e5e5e5" },
+  { key: "red" as const, label: "R", stroke: "#f87171" },
+  { key: "green" as const, label: "G", stroke: "#4ade80" },
+  { key: "blue" as const, label: "B", stroke: "#60a5fa" },
+];
+
+const CurveEditor = ({
+  curves,
+  onChange,
+}: {
+  curves: GradeCurves;
+  onChange: (next: GradeCurves) => void;
+}) => {
+  const [channel, setChannel] = useState<keyof GradeCurves>("master");
+  const svgRef = useRef<SVGSVGElement>(null);
+  const dragIndex = useRef<number | null>(null);
+  const points = curves[channel];
+  const meta = CURVE_CHANNELS.find((c) => c.key === channel)!;
+
+  const toLocal = (e: React.PointerEvent): CurvePoint => {
+    const rect = svgRef.current!.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = 1 - (e.clientY - rect.top) / rect.height;
+    return [Math.max(0, Math.min(1, x)), Math.max(0, Math.min(1, y))];
+  };
+
+  const commit = (pts: CurvePoint[]) => {
+    const sorted = [...pts].sort((a, b) => a[0] - b[0]);
+    onChange({ ...curves, [channel]: sorted });
+  };
+
+  const onDown = (e: React.PointerEvent) => {
+    e.preventDefault();
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    const [x, y] = toLocal(e);
+    // Grab the nearest point within a small radius, else insert a new one.
+    let nearest = -1;
+    let best = 0.05;
+    points.forEach((p, i) => {
+      const d = Math.hypot(p[0] - x, p[1] - y);
+      if (d < best) { best = d; nearest = i; }
+    });
+    if (e.shiftKey && nearest > 0 && nearest < points.length - 1) {
+      commit(points.filter((_, i) => i !== nearest));
+      return;
+    }
+    if (nearest === -1) {
+      const next = [...points, [x, y] as CurvePoint];
+      dragIndex.current = next.length - 1;
+      commit(next);
+    } else {
+      dragIndex.current = nearest;
+    }
+  };
+
+  const onMove = (e: React.PointerEvent) => {
+    if (dragIndex.current === null) return;
+    const [x, y] = toLocal(e);
+    const i = dragIndex.current;
+    const isEndpoint = i === 0 || i === points.length - 1;
+    const next = points.map((p, idx) =>
+      idx === i ? ([isEndpoint ? p[0] : x, y] as CurvePoint) : p,
+    );
+    commit(next);
+    // Re-track index after re-sort by matching the y we set (endpoints keep x).
+    dragIndex.current = next
+      .map((p, idx) => ({ p, idx }))
+      .sort((a, b) => a.p[0] - b.p[0])
+      .findIndex(({ idx }) => idx === i);
+  };
+
+  const onUp = () => { dragIndex.current = null; };
+
+  // Sample the curve into a polyline for display.
+  const path = Array.from({ length: 33 }, (_, k) => {
+    const x = k / 32;
+    const y = evalCurve(points, x);
+    return `${x * 100},${(1 - y) * 100}`;
+  }).join(" ");
+
+  return (
+    <div className="mt-1 border-t border-edge/60 pt-1.5">
+      <div className="mb-1 flex items-center gap-1">
+        {CURVE_CHANNELS.map((c) => (
+          <button
+            key={c.key}
+            onClick={() => setChannel(c.key)}
+            className={`rounded px-1.5 py-0.5 text-[9px] font-mono ${channel === c.key ? "bg-accent/30 text-neutral-100" : "text-neutral-500 hover:text-neutral-300"}`}
+          >
+            {c.label}
+          </button>
+        ))}
+        <span className="ml-auto text-[8px] text-neutral-600">drag · shift-click removes</span>
+      </div>
+      <svg
+        ref={svgRef}
+        viewBox="0 0 100 100"
+        preserveAspectRatio="none"
+        className="h-24 w-full cursor-crosshair touch-none rounded border border-edge bg-black/40"
+        onPointerDown={onDown}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+      >
+        <line x1="0" y1="100" x2="100" y2="0" stroke="#333" strokeWidth="0.5" />
+        <polyline points={path} fill="none" stroke={meta.stroke} strokeWidth="1.2" vectorEffect="non-scaling-stroke" />
+        {points.map((p, i) => (
+          <circle key={i} cx={p[0] * 100} cy={(1 - p[1]) * 100} r="2" fill={meta.stroke} stroke="#000" strokeWidth="0.4" />
+        ))}
+      </svg>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Grade presets (persisted to localStorage) + HSL secondary
+// ---------------------------------------------------------------------------
+
+const PRESET_KEY = "webcut.gradePresets.v1";
+
+const loadGradePresets = (): GradePreset[] => {
+  try {
+    const raw = localStorage.getItem(PRESET_KEY);
+    return raw ? (JSON.parse(raw) as GradePreset[]) : [];
+  } catch {
+    return [];
+  }
+};
+
+const saveGradePresets = (presets: GradePreset[]): void => {
+  try {
+    localStorage.setItem(PRESET_KEY, JSON.stringify(presets));
+  } catch {
+    /* storage unavailable */
+  }
+};
+
 const ColorSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
+  const copyGrade = useTimelineStore((s) => s.copyGrade);
+  const pasteGrade = useTimelineStore((s) => s.pasteGradeToSelection);
+  const applyGrade = useTimelineStore((s) => s.applyGradeToSelection);
+  const [presets, setPresets] = useState<GradePreset[]>(() => (typeof localStorage !== "undefined" ? loadGradePresets() : []));
   if (item.type !== "clip") return null;
   const grade: ColorGrade = item.grade ?? identityGrade();
   const setGrade = (patch: Partial<ColorGrade>) =>
     updateItem(item.id, (it) => (it.type === "clip" ? { ...it, grade: { ...grade, ...patch } } : it), "grade");
+  const hsl: HslQualifier = grade.hsl ?? identityHsl();
+  const setHsl = (patch: Partial<HslQualifier>) => setGrade({ hsl: { ...hsl, ...patch } });
+
+  const onImportLut = async (file: File) => {
+    try {
+      const text = await file.text();
+      const lut = parseCubeLut(text);
+      const id = registerLut(file.name, lut);
+      setGrade({ lut3dId: id, lut3dName: file.name });
+    } catch (err) {
+      console.error("[WebCut] LUT import failed:", err);
+      alert(`Could not import LUT: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const savePreset = () => {
+    const name = prompt("Preset name:");
+    if (!name) return;
+    const next = [...presets, { id: createId(), name, grade }];
+    setPresets(next);
+    saveGradePresets(next);
+  };
+
   return (
     <Section title="Color">
       <GradeTriple label="Lift (shadows)" value={grade.lift} min={-0.5} max={0.5} center={0} onChange={(lift) => setGrade({ lift })} />
@@ -957,6 +1196,71 @@ const ColorSection = ({ item, updateItem }: { item: TrackItem; updateItem: Updat
         <SliderRow label="Temperature" value={grade.temperature} min={-0.3} max={0.3} step={0.005} onChange={(v) => setGrade({ temperature: v })} />
         <SliderRow label="Tint" value={grade.tint} min={-0.3} max={0.3} step={0.005} onChange={(v) => setGrade({ tint: v })} />
       </div>
+
+      {/* Tone curves (#42) */}
+      <CurveEditor
+        curves={grade.curves ?? identityCurves()}
+        onChange={(curves) => setGrade({ curves: isIdentityCurves(curves) ? undefined : curves })}
+      />
+
+      {/* HSL secondary qualifier (#43) */}
+      <details className="mt-1.5 border-t border-edge/60 pt-1">
+        <summary className="cursor-pointer text-[9px] uppercase tracking-wide text-neutral-500">HSL secondary</summary>
+        <div className="pt-1">
+          <SliderRow label="Center hue °" value={hsl.centerHue} min={0} max={360} step={1} onChange={(v) => setHsl({ centerHue: v })} />
+          <SliderRow label="Range °" value={hsl.hueWidth} min={2} max={120} step={1} onChange={(v) => setHsl({ hueWidth: v })} />
+          <SliderRow label="Softness °" value={hsl.softness} min={0} max={60} step={1} onChange={(v) => setHsl({ softness: v })} />
+          <SliderRow label="Hue shift °" value={hsl.hueShift} min={-180} max={180} step={1} onChange={(v) => setHsl({ hueShift: v })} />
+          <SliderRow label="Saturation ×" value={hsl.satScale} min={0} max={2} step={0.02} onChange={(v) => setHsl({ satScale: v })} />
+          <SliderRow label="Lightness ×" value={hsl.lumScale} min={0} max={2} step={0.02} onChange={(v) => setHsl({ lumScale: v })} />
+        </div>
+      </details>
+
+      {/* 3D LUT (#44) */}
+      <div className="mt-1.5 flex items-center gap-1 border-t border-edge/60 pt-1.5">
+        <label className="flex-1 cursor-pointer rounded border border-edge px-2 py-0.5 text-center text-[10px] text-neutral-300 hover:border-accent/60">
+          {grade.lut3dName ? `LUT: ${grade.lut3dName}` : "Import .cube LUT"}
+          <input
+            type="file"
+            accept=".cube"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void onImportLut(f);
+              e.target.value = "";
+            }}
+          />
+        </label>
+        {grade.lut3dId && (
+          <button
+            onClick={() => setGrade({ lut3dId: undefined, lut3dName: undefined })}
+            className="rounded border border-edge px-1.5 py-0.5 text-[10px] text-neutral-400 hover:border-red-500/60"
+          >
+            ✕
+          </button>
+        )}
+      </div>
+
+      {/* Presets + copy/paste (#46) */}
+      <div className="mt-1.5 flex flex-wrap gap-1 border-t border-edge/60 pt-1.5">
+        <button onClick={() => copyGrade(item.id)} className="rounded border border-edge px-1.5 py-0.5 text-[10px] text-neutral-300 hover:border-accent/60">Copy</button>
+        <button onClick={() => pasteGrade()} className="rounded border border-edge px-1.5 py-0.5 text-[10px] text-neutral-300 hover:border-accent/60">Paste</button>
+        <button onClick={savePreset} className="rounded border border-edge px-1.5 py-0.5 text-[10px] text-neutral-300 hover:border-accent/60">Save preset</button>
+        <select
+          value=""
+          onChange={(e) => {
+            const p = presets.find((x) => x.id === e.target.value);
+            if (p) applyGrade(p.grade);
+          }}
+          className="min-w-0 flex-1 rounded border border-edge bg-panel-raised px-1 py-0.5 text-[10px] text-neutral-300"
+        >
+          <option value="">Apply preset…</option>
+          {presets.map((p) => (
+            <option key={p.id} value={p.id}>{p.name}</option>
+          ))}
+        </select>
+      </div>
+
       <button
         onClick={() => updateItem(item.id, (it) => (it.type === "clip" ? { ...it, grade: undefined } : it), "grade")}
         className="mt-1 w-full rounded border border-edge px-2 py-0.5 text-[10px] text-neutral-400 hover:border-accent/60"
@@ -1089,6 +1393,7 @@ const Inspector = () => {
             <TextSection item={selectedItem} updateItem={updateItem} />
             <ShapeSection item={selectedItem} updateItem={updateItem} />
             <ClipSection item={selectedItem} updateItem={updateItem} />
+            <SpeedSection item={selectedItem} />
             <ColorSection item={selectedItem} updateItem={updateItem} />
             <BlendSection item={selectedItem} updateItem={updateItem} />
 
@@ -1344,6 +1649,277 @@ const ScopesPanel = ({ onClose }: { onClose: () => void }) => {
       <p className="mt-2 text-[10px] leading-relaxed text-neutral-600">
         Live readout of the composited preview. Adjust a clip's grade and watch the trace respond.
       </p>
+    </Modal>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Audio mixer panel (#48) + loudness/ducking (#54/#53)
+// ---------------------------------------------------------------------------
+
+/** Peak level [0,1] of a track's active clip at the current playhead. */
+const useMixerLevels = (): Record<string, number> => {
+  const tracks = useTimelineStore((s) => s.project.tracks);
+  const assets = useTimelineStore((s) => s.project.assets);
+  const [levels, setLevels] = useState<Record<string, number>>({});
+  const waveCache = useRef<Map<string, number[] | null>>(new Map());
+
+  useEffect(() => {
+    let raf = 0;
+    const loop = () => {
+      const frame = transport.getFrame();
+      const next: Record<string, number> = {};
+      for (const track of tracks) {
+        const clip = track.items.find(
+          (i) => i.type === "clip" && frame >= i.startFrame && frame < i.startFrame + i.durationFrames,
+        ) as ClipItem | undefined;
+        let level = 0;
+        if (clip && !track.muted && !clip.audioMuted) {
+          const asset = assets.find((a) => a.id === clip.assetId);
+          if (asset) {
+            const key = asset.handleKey;
+            if (!waveCache.current.has(key)) {
+              waveCache.current.set(key, null); // pending sentinel
+              void getWaveform(asset).then((w) => waveCache.current.set(key, w));
+            }
+            const wave = waveCache.current.get(key);
+            if (wave && wave.length > 0 && asset.durationFrames > 0) {
+              const src = clip.sourceInFrame + (frame - clip.startFrame) * clip.speed;
+              const idx = Math.max(0, Math.min(wave.length - 1, Math.floor((src / asset.durationFrames) * wave.length)));
+              const gainLin = Math.pow(10, ((clip.audioGainDb ?? 0) + (track.gainDb ?? 0)) / 20);
+              level = Math.max(0, Math.min(1, wave[idx] * gainLin));
+            }
+          }
+        }
+        next[track.id] = level;
+      }
+      setLevels(next);
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [tracks, assets]);
+
+  return levels;
+};
+
+const MixerStrip = ({
+  track,
+  level,
+  onStatus,
+}: {
+  track: Track;
+  level: number;
+  onStatus: (msg: string) => void;
+}) => {
+  const setTrackAudio = useTimelineStore((s) => s.setTrackAudio);
+  const toggleTrackFlag = useTimelineStore((s) => s.toggleTrackFlag);
+  const setClipGainKeyframes = useTimelineStore((s) => s.setClipGainKeyframes);
+  const tracks = useTimelineStore((s) => s.project.tracks);
+  const assets = useTimelineStore((s) => s.project.assets);
+  const fps = useTimelineStore((s) => s.project.settings.frameRate);
+  const [busy, setBusy] = useState(false);
+
+  const activeClip = (t: Track): ClipItem | undefined => {
+    const frame = transport.getFrame();
+    return t.items.find(
+      (i) => i.type === "clip" && frame >= i.startFrame && frame < i.startFrame + i.durationFrames,
+    ) as ClipItem | undefined;
+  };
+
+  const normalize = async () => {
+    const clip = activeClip(track);
+    const asset = clip && assets.find((a) => a.id === clip.assetId);
+    if (!clip || !asset) return onStatus("No clip under playhead");
+    setBusy(true);
+    try {
+      const file = await fileSystemService.resolveMediaFile(asset.handleKey);
+      const buf = await file.arrayBuffer();
+      const audio = await decodeAudio(buf);
+      const { integratedLufs } = measureLoudness(audio);
+      const gain = gainToTargetLufs(integratedLufs, LUFS_TARGETS[0].lufs);
+      setTrackAudio(track.id, { gainDb: Math.max(-30, Math.min(6, gain)) });
+      onStatus(`${track.name}: ${integratedLufs.toFixed(1)} LUFS → ${gain >= 0 ? "+" : ""}${gain.toFixed(1)} dB`);
+    } catch (err) {
+      onStatus(`Loudness failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const duckUnder = async (dialogueTrackId: string) => {
+    const music = activeClip(track);
+    const dialogueTrack = tracks.find((t) => t.id === dialogueTrackId);
+    const dialogueClip = dialogueTrack && activeClip(dialogueTrack);
+    const dialogueAsset = dialogueClip && assets.find((a) => a.id === dialogueClip.assetId);
+    if (!music || !dialogueClip || !dialogueAsset) return onStatus("Need a clip on both tracks under the playhead");
+    setBusy(true);
+    try {
+      const file = await fileSystemService.resolveMediaFile(dialogueAsset.handleKey);
+      const audio = await decodeAudio(await file.arrayBuffer());
+      const offset = dialogueClip.startFrame - music.startFrame;
+      const kfs = computeDuckingKeyframes(audio, fps, music.durationFrames, offset, defaultDuckOptions());
+      setClipGainKeyframes(music.id, kfs);
+      onStatus(`Ducked ${music.name} under ${dialogueTrack!.name} (${kfs.length} points)`);
+    } catch (err) {
+      onStatus(`Ducking failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const otherTracks = tracks.filter((t) => t.id !== track.id);
+
+  return (
+    <div className="flex w-24 shrink-0 flex-col items-center gap-1 rounded border border-edge bg-panel/40 p-2">
+      <span className="w-full truncate text-center text-[10px] font-medium text-neutral-300">{track.name}</span>
+      {/* VU meter */}
+      <div className="relative h-24 w-3 overflow-hidden rounded bg-black/60">
+        <div
+          className="absolute bottom-0 w-full transition-[height] duration-75"
+          style={{
+            height: `${Math.round(level * 100)}%`,
+            background: level > 0.9 ? "#ef4444" : level > 0.7 ? "#f59e0b" : "#22c55e",
+          }}
+        />
+      </div>
+      {/* Fader */}
+      <input
+        type="range"
+        min={-30}
+        max={6}
+        step={0.5}
+        value={track.gainDb ?? 0}
+        onChange={(e) => setTrackAudio(track.id, { gainDb: Number(e.target.value) })}
+        className="h-1 w-full cursor-pointer appearance-none rounded bg-panel-raised accent-(--color-accent)"
+      />
+      <span className="font-mono text-[9px] text-neutral-500">{(track.gainDb ?? 0).toFixed(1)} dB</span>
+      {/* Pan */}
+      <input
+        type="range"
+        min={-1}
+        max={1}
+        step={0.05}
+        value={track.pan ?? 0}
+        onChange={(e) => setTrackAudio(track.id, { pan: Number(e.target.value) })}
+        className="h-1 w-full cursor-pointer appearance-none rounded bg-panel-raised accent-(--color-accent)"
+      />
+      <span className="font-mono text-[9px] text-neutral-500">
+        pan {(track.pan ?? 0) === 0 ? "C" : (track.pan ?? 0) < 0 ? `L${Math.round(-(track.pan ?? 0) * 100)}` : `R${Math.round((track.pan ?? 0) * 100)}`}
+      </span>
+      <div className="flex gap-1">
+        <button
+          onClick={() => toggleTrackFlag(track.id, "muted")}
+          className={`rounded px-1.5 py-0.5 text-[9px] ${track.muted ? "bg-red-500/70 text-white" : "border border-edge text-neutral-400"}`}
+        >
+          M
+        </button>
+        <button
+          onClick={() => toggleTrackFlag(track.id, "soloed")}
+          className={`rounded px-1.5 py-0.5 text-[9px] ${track.soloed ? "bg-amber-500/70 text-black" : "border border-edge text-neutral-400"}`}
+        >
+          S
+        </button>
+      </div>
+      <button
+        disabled={busy}
+        onClick={normalize}
+        className="w-full rounded border border-edge px-1 py-0.5 text-[9px] text-neutral-300 hover:border-accent/60 disabled:opacity-40"
+        title="Measure LUFS and set fader to reach −14 LUFS"
+      >
+        Normalize
+      </button>
+      {otherTracks.length > 0 && (
+        <select
+          value=""
+          disabled={busy}
+          onChange={(e) => e.target.value && void duckUnder(e.target.value)}
+          className="w-full rounded border border-edge bg-panel-raised px-0.5 py-0.5 text-[9px] text-neutral-400"
+          title="Auto-duck this track under another"
+        >
+          <option value="">Duck under…</option>
+          {otherTracks.map((t) => (
+            <option key={t.id} value={t.id}>{t.name}</option>
+          ))}
+        </select>
+      )}
+    </div>
+  );
+};
+
+const MixerPanel = ({ onClose }: { onClose: () => void }) => {
+  const tracks = useTimelineStore((s) => s.project.tracks);
+  const levels = useMixerLevels();
+  const [status, setStatus] = useState("");
+  return (
+    <Modal title="AUDIO MIXER" icon={<SlidersHorizontal size={14} className="text-accent" />} onClose={onClose}>
+      <div className="flex gap-2 overflow-x-auto pb-1">
+        {tracks.map((track) => (
+          <MixerStrip key={track.id} track={track} level={levels[track.id] ?? 0} onStatus={setStatus} />
+        ))}
+      </div>
+      <p className="mt-2 min-h-[14px] text-[10px] text-accent">{status}</p>
+      <p className="mt-1 text-[10px] leading-relaxed text-neutral-600">
+        Faders/mute/solo affect playback live. VU meters read the waveform under the playhead. Normalize
+        measures integrated LUFS (ITU-R BS.1770); “Duck under” writes gain automation. Pan is stored per
+        track (stereo panning applies once a Web Audio graph is added).
+      </p>
+    </Modal>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts editor (#75)
+// ---------------------------------------------------------------------------
+
+const ShortcutsPanel = ({ onClose }: { onClose: () => void }) => {
+  const bindings = useKeymap();
+  const [capturing, setCapturing] = useState<CommandId | null>(null);
+
+  useEffect(() => {
+    if (!capturing) return;
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape") { setCapturing(null); return; }
+      // Ignore lone modifier presses; wait for a real key.
+      if (["Control", "Meta", "Shift", "Alt"].includes(e.key)) return;
+      setBinding(capturing, chordFromEvent(e));
+      setCapturing(null);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [capturing]);
+
+  const groups = Array.from(new Set(COMMANDS.map((c) => c.group)));
+  return (
+    <Modal title="KEYBOARD SHORTCUTS" icon={<Keyboard size={14} className="text-accent" />} onClose={onClose}>
+      <div className="max-h-[60vh] overflow-y-auto pr-1">
+        {groups.map((group) => (
+          <div key={group} className="mb-3">
+            <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{group}</p>
+            {COMMANDS.filter((c) => c.group === group).map((cmd) => (
+              <div key={cmd.id} className="flex items-center justify-between border-b border-edge/40 py-1">
+                <span className="text-[11px] text-neutral-300">{cmd.label}</span>
+                <button
+                  onClick={() => setCapturing(cmd.id)}
+                  className={`min-w-[64px] rounded border px-2 py-0.5 text-center font-mono text-[10px] ${
+                    capturing === cmd.id ? "border-accent bg-accent/20 text-accent" : "border-edge text-neutral-300 hover:border-accent/60"
+                  }`}
+                >
+                  {capturing === cmd.id ? "press…" : prettyChord(bindings[cmd.id] ?? cmd.defaultChord)}
+                </button>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+      <button
+        onClick={() => resetBindings()}
+        className="mt-2 w-full rounded border border-edge px-2 py-1 text-[10px] text-neutral-400 hover:border-accent/60"
+      >
+        Reset all to defaults
+      </button>
     </Modal>
   );
 };
@@ -1686,7 +2262,7 @@ export const MainLayout = () => {
   const frameRate = useTimelineStore((state) => state.project.settings.frameRate);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [showDiag, setShowDiag] = useState(false);
-  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes">(null);
+  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes" | "mixer" | "shortcuts">(null);
 
   const flashStatus = useCallback((message: string) => {
     setStatusMessage(message);
@@ -1790,6 +2366,12 @@ export const MainLayout = () => {
         <button onClick={() => setModal("scopes")} title="Scopes" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
           <BarChart3 size={12} />
         </button>
+        <button onClick={() => setModal("mixer")} title="Audio mixer" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
+          <SlidersHorizontal size={12} />
+        </button>
+        <button onClick={() => setModal("shortcuts")} title="Keyboard shortcuts" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
+          <Keyboard size={12} />
+        </button>
         <button
           onClick={() => setShowDiag(true)}
           title="Diagnostics"
@@ -1832,6 +2414,8 @@ export const MainLayout = () => {
       {showDiag && <DiagnosticsPanel onClose={() => setShowDiag(false)} />}
       {modal === "subtitles" && <SubtitlesPanel onClose={() => setModal(null)} />}
       {modal === "scopes" && <ScopesPanel onClose={() => setModal(null)} />}
+      {modal === "mixer" && <MixerPanel onClose={() => setModal(null)} />}
+      {modal === "shortcuts" && <ShortcutsPanel onClose={() => setModal(null)} />}
       {modal === "sounds" && <SoundsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "projects" && <ProjectsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
     </div>

@@ -20,10 +20,13 @@ import { subscribeWithSelector } from "zustand/middleware";
 import {
   createEmptyProject,
   createId,
+  identityGrade,
+  isIdentityGrade,
   MARKER_COLORS,
   sampleAnimatable,
   type AnimatableValue,
   type ClipItem,
+  type ColorGrade,
   type Effect,
   type Keyframe,
   type KeyframeId,
@@ -236,6 +239,22 @@ export interface TimelineState {
   slipItem(itemId: TrackItemId, deltaFrames: number): void;
   rollItem(itemId: TrackItemId, deltaFrames: number): void;
   slideItem(itemId: TrackItemId, deltaFrames: number): void;
+  // track mixer / styling
+  setTrackAudio(trackId: TrackId, patch: { gainDb?: number; pan?: number }): void;
+  setTrackColor(trackId: TrackId, color: string | undefined): void;
+  setTrackHeight(trackId: TrackId, heightPx: number): void;
+  // speed ramping (#52)
+  setClipSpeed(itemId: TrackItemId, speed: number): void;
+  setSpeedRampPoint(itemId: TrackItemId, localFrame: number, speed: number): void;
+  clearSpeedRamp(itemId: TrackItemId): void;
+  // freeze frame (#55)
+  freezeFrame(itemId: TrackItemId, atFrame: number, holdFrames: number): void;
+  // grade presets / copy-paste (#46)
+  copyGrade(itemId: TrackItemId): void;
+  pasteGradeToSelection(): void;
+  applyGradeToSelection(grade: ColorGrade): void;
+  // audio automation (#53 ducking)
+  setClipGainKeyframes(itemId: TrackItemId, keyframes: readonly Keyframe<number>[]): void;
   // clipboard + history
   copySelection(): void;
   cutSelection(): void;
@@ -292,6 +311,24 @@ const patchKeyframe = (
 
 /** Cast a transform property (Vec2 or number animatable) to the number-typed view. */
 const asNum = (av: Transform["position"] | Transform["rotation"]): NumAnimatable => av as unknown as NumAnimatable;
+
+/** Clamp a speed multiplier to a sane, non-degenerate range (allows reverse). */
+const clampSpeed = (speed: number): number => {
+  const s = Math.max(-8, Math.min(8, speed));
+  // Avoid exactly 0 for the flat speed (freeze uses a dedicated still segment).
+  return Math.abs(s) < 0.01 ? (s < 0 ? -0.01 : 0.01) : s;
+};
+
+/** Insert or replace a keyframe carrying an explicit value at a whole frame. */
+const setRampPoint = (av: NumAnimatable, frame: number, value: number): NumAnimatable => {
+  const whole = Math.max(0, Math.round(frame));
+  const kf: Keyframe<number> = { id: createId<KeyframeId>(), frame: whole, value, interpolation: "linear" };
+  const existing = av.kind === "animated" ? av.keyframes.filter((k) => k.frame !== whole) : [];
+  return { kind: "animated", keyframes: [...existing, kf].sort((a, b) => a.frame - b.frame) };
+};
+
+/** Session clipboard for copy/paste of a color grade between clips (#46). */
+let gradeClipboard: ColorGrade | null = null;
 
 // -- Undo/redo history bookkeeping -------------------------------------------
 // Continuous gestures (drags, slider scrubs) would otherwise flood the undo
@@ -853,6 +890,181 @@ export const useTimelineStore = create<TimelineState>()(
         },
         revision: state.revision + 1,
         ...pushPastCoalesced(state, "slide"),
+      })),
+
+    // -- track mixer / styling --------------------------------------------------
+
+    setTrackAudio: (trackId, patch) =>
+      set((state) => ({
+        project: {
+          ...state.project,
+          tracks: state.project.tracks.map((track) =>
+            track.id === trackId ? { ...track, ...patch } : track,
+          ),
+        },
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, `trackaudio:${trackId}`),
+      })),
+
+    setTrackColor: (trackId, color) =>
+      set((state) => ({
+        project: {
+          ...state.project,
+          tracks: state.project.tracks.map((track) =>
+            track.id === trackId ? { ...track, color } : track,
+          ),
+        },
+        revision: state.revision + 1,
+        ...pushPast(state),
+      })),
+
+    setTrackHeight: (trackId, heightPx) =>
+      set((state) => ({
+        project: {
+          ...state.project,
+          tracks: state.project.tracks.map((track) =>
+            track.id === trackId ? { ...track, heightPx: Math.max(28, Math.min(200, Math.round(heightPx))) } : track,
+          ),
+        },
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, `trackh:${trackId}`),
+      })),
+
+    // -- speed ramping (#52) ----------------------------------------------------
+
+    setClipSpeed: (itemId, speed) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) =>
+          item.id === itemId && item.type === "clip"
+            ? { ...item, speed: clampSpeed(speed) }
+            : item,
+        ),
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, `speed:${itemId}`),
+      })),
+
+    setSpeedRampPoint: (itemId, localFrame, speed) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) => {
+          if (item.id !== itemId || item.type !== "clip") return item;
+          const ramp = item.speedRamp ?? { kind: "static" as const, value: item.speed };
+          return { ...item, speedRamp: setRampPoint(ramp, localFrame, clampSpeed(speed)) };
+        }),
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, `ramp:${itemId}`),
+      })),
+
+    clearSpeedRamp: (itemId) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) => {
+          if (item.id !== itemId || item.type !== "clip") return item;
+          const { speedRamp, ...rest } = item;
+          void speedRamp;
+          return rest as TrackItem;
+        }),
+        revision: state.revision + 1,
+        ...pushPast(state),
+      })),
+
+    // -- freeze frame (#55) -----------------------------------------------------
+    // Split the clip at `atFrame` and insert a zero-speed still of `holdFrames`
+    // that holds the source frame at the cut; downstream content shifts right.
+    freezeFrame: (itemId, atFrame, holdFrames) =>
+      set((state) => {
+        const hold = Math.max(1, Math.round(holdFrames));
+        const cut = Math.round(atFrame);
+        return {
+          project: {
+            ...state.project,
+            tracks: state.project.tracks.map((track) => {
+              const target = track.items.find((i) => i.id === itemId);
+              if (!target || target.type !== "clip") return track;
+              if (cut <= target.startFrame || cut >= target.startFrame + target.durationFrames) return track;
+
+              const leftDur = cut - target.startFrame;
+              const frozenSource = target.sourceInFrame + Math.round(leftDur * target.speed);
+              const left: TrackItem = { ...target, durationFrames: leftDur };
+              const frozen: ClipItem = {
+                ...target,
+                id: createId<TrackItemId>(),
+                name: `${target.name} (freeze)`,
+                startFrame: cut,
+                durationFrames: hold,
+                sourceInFrame: frozenSource,
+                speed: 0,
+                speedRamp: undefined,
+              };
+              const right: TrackItem = {
+                ...target,
+                id: createId<TrackItemId>(),
+                startFrame: cut + hold,
+                durationFrames: target.durationFrames - leftDur,
+                sourceInFrame: frozenSource,
+              };
+              // Shift everything after the original clip right by the hold length.
+              const oldEnd = target.startFrame + target.durationFrames;
+              const items = track.items.flatMap((i) => (i.id === itemId ? [left, frozen, right] : [i]));
+              const shifted = items.map((i) =>
+                i.id !== left.id && i.id !== frozen.id && i.id !== right.id && i.startFrame >= oldEnd
+                  ? { ...i, startFrame: i.startFrame + hold }
+                  : i,
+              );
+              return { ...track, items: shifted };
+            }),
+          },
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
+
+    // -- grade presets / copy-paste (#46) ---------------------------------------
+
+    copyGrade: (itemId) =>
+      set((state) => {
+        for (const track of state.project.tracks) {
+          const item = track.items.find((i) => i.id === itemId);
+          if (item && item.type === "clip") {
+            gradeClipboard = item.grade ?? identityGrade();
+            break;
+          }
+        }
+        return state;
+      }),
+
+    pasteGradeToSelection: () => {
+      if (gradeClipboard) get().applyGradeToSelection(gradeClipboard);
+    },
+
+    applyGradeToSelection: (grade) =>
+      set((state) => {
+        const sel = new Set(state.selectedItemIds);
+        if (sel.size === 0) return state;
+        return {
+          project: mapItems(state.project, (item) =>
+            sel.has(item.id) && item.type === "clip"
+              ? { ...item, grade: isIdentityGrade(grade) ? undefined : grade }
+              : item,
+          ),
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
+
+    // -- audio automation (#53 ducking) -----------------------------------------
+
+    setClipGainKeyframes: (itemId, keyframes) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) => {
+          if (item.id !== itemId || item.type !== "clip") return item;
+          if (keyframes.length === 0) {
+            const { gainRamp, ...rest } = item;
+            void gainRamp;
+            return rest as TrackItem;
+          }
+          return { ...item, gainRamp: { kind: "animated", keyframes } };
+        }),
+        revision: state.revision + 1,
+        ...pushPast(state),
       })),
 
     toggleTrackFlag: (trackId, flag) =>
