@@ -17,8 +17,10 @@ import { fileSystemService } from "./FileSystemService";
 import { transport, useTimelineStore } from "../store/timelineStore";
 import {
   defaultCorridorKeyParams,
+  integrateClipSource,
   isOverlayItem,
   sampleAnimatable,
+  sampleClipSpeed,
   type BlendMode,
   type ClipItem,
   type ColorGrade,
@@ -64,6 +66,8 @@ interface ActiveLayerClip {
   readonly asset: MediaAsset;
   readonly trackId: string;
   readonly trackMuted: boolean;
+  /** Track-level mixer trim (dB), summed with per-clip gain. */
+  readonly trackGainDb: number;
   /** Compositing order: ascending = bottom -> top. */
   readonly order: number;
 }
@@ -93,7 +97,7 @@ const resolveActiveClips = (project: Project, frame: number): ActiveLayerClip[] 
       if (wholeFrame < item.startFrame || wholeFrame >= item.startFrame + item.durationFrames) continue;
       const asset = project.assets.find((candidate) => candidate.id === item.assetId);
       if (!asset || asset.kind === "audio") continue;
-      layers.push({ clip: item, asset, trackId: track.id, trackMuted: track.muted, order: track.index });
+      layers.push({ clip: item, asset, trackId: track.id, trackMuted: track.muted, trackGainDb: track.gainDb ?? 0, order: track.index });
       break;
     }
   }
@@ -254,7 +258,7 @@ class PreviewService {
 
     const keepVideos = new Set<RVFCVideo>();
 
-    for (const { clip, asset, trackId, trackMuted, order } of actives) {
+    for (const { clip, asset, trackId, trackMuted, trackGainDb, order } of actives) {
       const key = corridorKeyOf(clip);
       sink.setLayerEffect(trackId, key.enabled, key.params);
       sink.setLayerBlend(trackId, clip.blendMode ?? "normal");
@@ -272,18 +276,22 @@ class PreviewService {
       if (!video) continue;
       keepVideos.add(video);
 
-      // Per-clip audio: apply gain + mute (track mute overrides).
-      video.muted = clip.audioMuted || trackMuted;
-      video.volume = dbToVolume(clip.audioGainDb);
-
       const localFrame = frame - clip.startFrame;
-      const mediaTimeS = (clip.sourceInFrame + localFrame * clip.speed) / fps;
+      // Per-clip audio: clip gain + keyframed gain ramp + track mixer trim.
+      // (Track mute overrides everything.)
+      const rampDb = clip.gainRamp ? sampleAnimatable(clip.gainRamp, localFrame) : 0;
+      video.muted = clip.audioMuted || trackMuted;
+      video.volume = dbToVolume(clip.audioGainDb + rampDb + trackGainDb);
+
+      // Ramp-aware source mapping: integrate the (possibly keyframed) speed.
+      const instantSpeed = sampleClipSpeed(clip, localFrame);
+      const mediaTimeS = (clip.sourceInFrame + integrateClipSource(clip, localFrame)) / fps;
       const clampedTimeS = Math.min(Math.max(0, mediaTimeS), Math.max(0, video.duration - 1 / fps));
 
       // Read the transport fresh here (not once at the top): a pause during an
       // earlier `await` in this sync must not leave the video playing.
-      if (transport.isPlaying() && clip.speed > 0) {
-        video.playbackRate = Math.min(16, clip.speed);
+      if (transport.isPlaying() && instantSpeed > 0) {
+        video.playbackRate = Math.min(16, instantSpeed);
         if (Math.abs(video.currentTime - clampedTimeS) > DRIFT_TOLERANCE_S) {
           video.currentTime = clampedTimeS;
         }

@@ -43,6 +43,7 @@ import {
   useTimelineStore,
   useTransportFrame,
 } from "../store/timelineStore";
+import { matchCommand } from "../store/keymap";
 import {
   framesToTimecode,
   identityTransform,
@@ -572,94 +573,123 @@ export const Timeline = () => {
   }, []);
 
   useEffect(() => {
+    const projectEndFrame = (): number => {
+      let max = 0;
+      for (const track of useTimelineStore.getState().project.tracks) {
+        for (const item of track.items) max = Math.max(max, item.startFrame + item.durationFrames);
+      }
+      return max;
+    };
+
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
       const store = useTimelineStore.getState();
+      const cmd = matchCommand(event);
 
-      // Modifier combos: undo/redo + clipboard. Handled before the plain-key
-      // switch so Ctrl+C/V don't collide with the razor/select tool keys.
-      if (event.metaKey || event.ctrlKey) {
-        switch (event.code) {
-          case "KeyZ":
+      // Commands resolve through the customizable keymap (#75). Tool keys
+      // (bare V/C for select/razor) aren't bound commands and fall through.
+      if (cmd) {
+        switch (cmd) {
+          case "playback.toggle":
             event.preventDefault();
-            if (event.shiftKey) store.redo();
-            else store.undo();
+            togglePlay();
             return;
-          case "KeyY":
+          case "playhead.prevFrame":
+            event.preventDefault();
+            transport.setFrame(Math.max(0, Math.round(transport.getFrame()) - (event.shiftKey ? 10 : 1)));
+            return;
+          case "playhead.nextFrame":
+            event.preventDefault();
+            transport.setFrame(Math.round(transport.getFrame()) + (event.shiftKey ? 10 : 1));
+            return;
+          case "playhead.start":
+            transport.setFrame(0);
+            return;
+          case "playhead.end":
+            transport.setFrame(projectEndFrame());
+            return;
+          case "marker.add":
+            store.addMarker(transport.getFrame());
+            return;
+          case "shuttle.forward": {
+            const r = transport.getRate();
+            transport.setRate(r > 0 ? Math.min(16, r * 2) : 1);
+            setIsPlaying(true);
+            return;
+          }
+          case "shuttle.back": {
+            const r = transport.getRate();
+            transport.setRate(r < 0 ? Math.max(-16, r * 2) : -1);
+            setIsPlaying(true);
+            return;
+          }
+          case "shuttle.stop":
+            transport.setRate(0);
+            setIsPlaying(false);
+            return;
+          case "edit.split": {
+            const frame = transport.getFrame();
+            for (const id of store.selectedItemIds) store.splitItemAtFrame(id, frame);
+            return;
+          }
+          case "edit.delete":
+            event.preventDefault();
+            if (store.selectedItemIds.length > 0) store.removeItems(store.selectedItemIds);
+            return;
+          case "edit.rippleDelete":
+            event.preventDefault();
+            if (store.selectedItemIds.length > 0) store.rippleDelete(store.selectedItemIds);
+            return;
+          case "edit.undo":
+            event.preventDefault();
+            store.undo();
+            return;
+          case "edit.redo":
             event.preventDefault();
             store.redo();
             return;
-          case "KeyC":
+          case "edit.copy":
             event.preventDefault();
             store.copySelection();
             return;
-          case "KeyX":
+          case "edit.cut":
             event.preventDefault();
             store.cutSelection();
             return;
-          case "KeyV":
+          case "edit.paste":
             event.preventDefault();
             store.pasteClipboard();
             return;
-          case "KeyD":
+          case "edit.duplicate":
             event.preventDefault();
             store.duplicateSelection();
             return;
-          default:
+          case "view.zoomIn":
+            event.preventDefault();
+            store.zoomBy(1.2);
+            return;
+          case "view.zoomOut":
+            event.preventDefault();
+            store.zoomBy(1 / 1.2);
             return;
         }
       }
 
+      // Unbound fallbacks: tool selection + Backspace delete.
+      if (event.metaKey || event.ctrlKey) return;
       switch (event.code) {
-        case "Space":
-          event.preventDefault();
-          togglePlay();
-          break;
-        case "ArrowLeft":
-          transport.setFrame(Math.max(0, Math.round(transport.getFrame()) - (event.shiftKey ? 10 : 1)));
-          break;
-        case "ArrowRight":
-          transport.setFrame(Math.round(transport.getFrame()) + (event.shiftKey ? 10 : 1));
-          break;
-        case "Home":
-          transport.setFrame(0);
-          break;
         case "KeyV":
           store.setActiveTool("select");
           break;
         case "KeyC":
           store.setActiveTool("razor");
           break;
-        case "KeyM":
-          store.addMarker(transport.getFrame());
-          break;
-        case "KeyL": {
-          // Shuttle forward; repeated presses accelerate (1×, 2×, 4×…).
-          const r = transport.getRate();
-          transport.setRate(r > 0 ? Math.min(16, r * 2) : 1);
-          setIsPlaying(true);
-          break;
-        }
-        case "KeyJ": {
-          // Shuttle in reverse; repeated presses accelerate backward.
-          const r = transport.getRate();
-          transport.setRate(r < 0 ? Math.max(-16, r * 2) : -1);
-          setIsPlaying(true);
-          break;
-        }
-        case "KeyK":
-          transport.setRate(0);
-          setIsPlaying(false);
-          break;
-        case "Delete":
-        case "Backspace": {
+        case "Backspace":
           if (store.selectedItemIds.length > 0) {
-            // Shift+Delete ripples (closes the gap); plain Delete leaves it.
             if (event.shiftKey) store.rippleDelete(store.selectedItemIds);
             else store.removeItems(store.selectedItemIds);
           }
           break;
-        }
       }
     };
     window.addEventListener("keydown", onKeyDown);

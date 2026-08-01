@@ -129,6 +129,73 @@ export const defaultCorridorKeyParams = (): CorridorKeyParams => ({
  * saturation, and a simple temperature/tint white balance. All fields default
  * to identity (no visual change).
  */
+/** A control point on a tone curve; both axes normalized to [0,1]. */
+export type CurvePoint = readonly [number, number];
+
+/** Per-channel tone curves (master applies to luma/all channels, then R/G/B). */
+export interface GradeCurves {
+  readonly master: readonly CurvePoint[];
+  readonly red: readonly CurvePoint[];
+  readonly green: readonly CurvePoint[];
+  readonly blue: readonly CurvePoint[];
+}
+
+/** The neutral curve: a straight line from (0,0) to (1,1). */
+export const identityCurveChannel = (): readonly CurvePoint[] => [
+  [0, 0],
+  [1, 1],
+];
+
+export const identityCurves = (): GradeCurves => ({
+  master: identityCurveChannel(),
+  red: identityCurveChannel(),
+  green: identityCurveChannel(),
+  blue: identityCurveChannel(),
+});
+
+const isIdentityCurveChannel = (pts: readonly CurvePoint[]): boolean =>
+  pts.length === 2 &&
+  pts[0][0] === 0 && pts[0][1] === 0 &&
+  pts[1][0] === 1 && pts[1][1] === 1;
+
+export const isIdentityCurves = (c: GradeCurves): boolean =>
+  isIdentityCurveChannel(c.master) &&
+  isIdentityCurveChannel(c.red) &&
+  isIdentityCurveChannel(c.green) &&
+  isIdentityCurveChannel(c.blue);
+
+/**
+ * A single HSL qualifier (secondary correction): pixels whose hue falls within
+ * a band around `centerHue` are shifted/re-saturated/re-lit, feathered by the
+ * band's soft edges. Identity when the shifts are all neutral.
+ */
+export interface HslQualifier {
+  /** Band center, degrees [0,360). */
+  readonly centerHue: number;
+  /** Half-width of the fully-selected band, degrees. */
+  readonly hueWidth: number;
+  /** Soft feather beyond the band, degrees. */
+  readonly softness: number;
+  /** Hue rotation applied to selected pixels, degrees. */
+  readonly hueShift: number;
+  /** Saturation multiplier for selected pixels (1 = unchanged). */
+  readonly satScale: number;
+  /** Lightness multiplier for selected pixels (1 = unchanged). */
+  readonly lumScale: number;
+}
+
+export const identityHsl = (): HslQualifier => ({
+  centerHue: 180,
+  hueWidth: 30,
+  softness: 15,
+  hueShift: 0,
+  satScale: 1,
+  lumScale: 1,
+});
+
+export const isIdentityHsl = (h: HslQualifier): boolean =>
+  h.hueShift === 0 && h.satScale === 1 && h.lumScale === 1;
+
 export interface ColorGrade {
   readonly lift: readonly [number, number, number];
   readonly gamma: readonly [number, number, number];
@@ -138,6 +205,18 @@ export interface ColorGrade {
   readonly saturation: number;
   readonly temperature: number;
   readonly tint: number;
+  /** RGB/luma tone curves; absent ⇒ identity. */
+  readonly curves?: GradeCurves;
+  /** HSL secondary qualifier; absent ⇒ identity. */
+  readonly hsl?: HslQualifier;
+  /**
+   * Reference to a 3D LUT registered in the LUT registry (see effects/lut.ts).
+   * Absent ⇒ no LUT. The referenced bytes live outside the serialized project,
+   * so a LUT must be re-imported after a reload.
+   */
+  readonly lut3dId?: string;
+  /** Human label of the applied LUT (kept for display after reload). */
+  readonly lut3dName?: string;
 }
 
 export const identityGrade = (): ColorGrade => ({
@@ -157,7 +236,17 @@ export const isIdentityGrade = (g: ColorGrade): boolean =>
   g.gamma[0] === 1 && g.gamma[1] === 1 && g.gamma[2] === 1 &&
   g.gain[0] === 1 && g.gain[1] === 1 && g.gain[2] === 1 &&
   g.brightness === 0 && g.contrast === 1 && g.saturation === 1 &&
-  g.temperature === 0 && g.tint === 0;
+  g.temperature === 0 && g.tint === 0 &&
+  (!g.curves || isIdentityCurves(g.curves)) &&
+  (!g.hsl || isIdentityHsl(g.hsl)) &&
+  !g.lut3dId;
+
+/** A named, reusable grade preset (persisted to localStorage by the UI). */
+export interface GradePreset {
+  readonly id: string;
+  readonly name: string;
+  readonly grade: ColorGrade;
+}
 
 export type Effect =
   | {
@@ -258,7 +347,18 @@ export interface ClipItem extends TrackItemBase {
   readonly sourceInFrame: number;
   /** Playback rate; 1 = realtime, negative values are reversed playback. */
   readonly speed: number;
+  /**
+   * Speed ramp: a keyframed speed multiplier over the clip's local frames.
+   * When present it overrides the flat `speed` for source mapping and preview
+   * playback rate. Absent ⇒ constant `speed`.
+   */
+  readonly speedRamp?: AnimatableValue<number>;
   readonly audioGainDb: number;
+  /**
+   * Keyframed gain automation in dB over local frames (e.g. auto-ducking).
+   * When present it is summed with `audioGainDb`. Absent ⇒ flat gain.
+   */
+  readonly gainRamp?: AnimatableValue<number>;
   readonly audioMuted: boolean;
   /** Primary color grade; absent ⇒ identity (no correction). */
   readonly grade?: ColorGrade;
@@ -372,6 +472,12 @@ export interface Track {
   readonly locked: boolean;
   readonly hidden: boolean;
   readonly heightPx: number;
+  /** Track-level audio trim in dB (mixer fader), summed with per-clip gain. Absent ⇒ 0. */
+  readonly gainDb?: number;
+  /** Stereo pan, -1 (hard left) … +1 (hard right). Absent ⇒ 0 (center). */
+  readonly pan?: number;
+  /** Optional custom color used to tint the track lane and clips. */
+  readonly color?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -591,4 +697,36 @@ export const framesToTimecode = (frame: number, fps: number): string => {
   const hh = Math.floor(totalSeconds / 3600);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(hh)}:${pad(mm)}:${pad(ss)}:${pad(ff)}`;
+};
+
+// ---------------------------------------------------------------------------
+// Speed ramping
+// ---------------------------------------------------------------------------
+
+/** Instantaneous playback speed at a clip-local frame (respects a speed ramp). */
+export const sampleClipSpeed = (clip: ClipItem, localFrame: number): number => {
+  if (clip.speedRamp) return sampleAnimatable(clip.speedRamp, localFrame);
+  return clip.speed;
+};
+
+/**
+ * Source-media offset (in source frames, relative to `sourceInFrame`) reached
+ * after `localFrame` timeline frames, integrating a possibly-ramped speed.
+ * For a constant speed this collapses to `localFrame * speed`. The integral is
+ * accumulated per whole frame — cheap, and exact for piecewise-linear ramps at
+ * frame granularity.
+ */
+export const integrateClipSource = (clip: ClipItem, localFrame: number): number => {
+  if (!clip.speedRamp || clip.speedRamp.kind === "static") {
+    return localFrame * sampleClipSpeed(clip, 0);
+  }
+  const whole = Math.max(0, Math.floor(localFrame));
+  let acc = 0;
+  for (let f = 0; f < whole; f++) {
+    // Midpoint speed of frame f keeps the sum symmetric under reversal.
+    acc += sampleAnimatable(clip.speedRamp, f + 0.5);
+  }
+  const frac = localFrame - whole;
+  if (frac > 0) acc += sampleAnimatable(clip.speedRamp, whole + frac * 0.5) * frac;
+  return acc;
 };

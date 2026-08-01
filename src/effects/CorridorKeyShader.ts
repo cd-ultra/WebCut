@@ -17,7 +17,15 @@
  * `useNeuralMatte` simply gates the blend in the shader.
  */
 
-import { isIdentityGrade, type BlendMode, type ColorGrade, type CorridorKeyParams } from "../types/timeline";
+import {
+  isIdentityCurves,
+  isIdentityGrade,
+  isIdentityHsl,
+  type BlendMode,
+  type ColorGrade,
+  type CorridorKeyParams,
+} from "../types/timeline";
+import { identityCurveLut, identityLut3D } from "./lut";
 
 // ---------------------------------------------------------------------------
 // WGSL
@@ -39,12 +47,20 @@ struct CorridorKeyUniforms {
   grade_gain : vec4<f32>,
   // x = saturation, y = temperature, z = tint, w = unused
   grade_misc : vec4<f32>,
+  // x = curves enabled, y = 3D LUT enabled, z = HSL enabled, w = HSL center hue (0..1)
+  grade_ext0 : vec4<f32>,
+  // x = HSL half-width (0..1), y = HSL softness (0..1), z = HSL hue shift (0..1 signed), w = HSL sat scale
+  grade_ext1 : vec4<f32>,
+  // x = HSL lum scale, y = 3D LUT size, zw = unused
+  grade_ext2 : vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> u : CorridorKeyUniforms;
 @group(1) @binding(1) var linear_sampler : sampler;
 @group(1) @binding(2) var source_tex : texture_2d<f32>;
 @group(1) @binding(3) var neural_matte_tex : texture_2d<f32>;
+@group(1) @binding(4) var curve_lut_tex : texture_2d<f32>;
+@group(1) @binding(5) var lut3d_tex : texture_3d<f32>;
 
 // BT.709 RGB -> chroma plane (Cb, Cr). Luma is intentionally discarded so the
 // key is exposure-invariant: shadows on the green screen survive the key.
@@ -151,6 +167,78 @@ fn suppress_spill(rgb : vec3<f32>, matte : f32) -> vec3<f32> {
 // saturation, and a simple temperature/tint white balance. Identity params
 // (lift 0, gamma 1, gain 1, brightness 0, contrast 1, saturation 1, temp/tint 0)
 // leave the color unchanged; the caller gates this with grade_lift.w.
+fn rgb_to_hsl(c : vec3<f32>) -> vec3<f32> {
+  let maxc = max(c.r, max(c.g, c.b));
+  let minc = min(c.r, min(c.g, c.b));
+  let l = (maxc + minc) * 0.5;
+  let d = maxc - minc;
+  var h = 0.0;
+  var s = 0.0;
+  if (d > 1e-5) {
+    s = select(d / (2.0 - maxc - minc), d / (maxc + minc), l < 0.5);
+    if (maxc == c.r) {
+      h = (c.g - c.b) / d + select(6.0, 0.0, c.g >= c.b);
+    } else if (maxc == c.g) {
+      h = (c.b - c.r) / d + 2.0;
+    } else {
+      h = (c.r - c.g) / d + 4.0;
+    }
+    h = h / 6.0;
+  }
+  return vec3<f32>(h, s, l); // h in [0,1)
+}
+
+fn hue_to_rgb(p : f32, q : f32, t_in : f32) -> f32 {
+  var t = fract(t_in);
+  if (t < 1.0 / 6.0) { return p + (q - p) * 6.0 * t; }
+  if (t < 0.5) { return q; }
+  if (t < 2.0 / 3.0) { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+  return p;
+}
+
+fn hsl_to_rgb(hsl : vec3<f32>) -> vec3<f32> {
+  let h = hsl.x;
+  let s = hsl.y;
+  let l = hsl.z;
+  if (s <= 1e-5) {
+    return vec3<f32>(l, l, l);
+  }
+  let q = select(l + s - l * s, l * (1.0 + s), l < 0.5);
+  let p = 2.0 * l - q;
+  return vec3<f32>(hue_to_rgb(p, q, h + 1.0 / 3.0), hue_to_rgb(p, q, h), hue_to_rgb(p, q, h - 1.0 / 3.0));
+}
+
+// Shortest angular distance between two normalized hues (each in [0,1)).
+fn hue_dist(a : f32, b : f32) -> f32 {
+  let d = abs(fract(a) - fract(b));
+  return min(d, 1.0 - d);
+}
+
+// HSL secondary qualifier: select a hue band (with soft feather) and shift its
+// hue / scale its saturation and lightness. Non-selected pixels are untouched.
+fn apply_hsl_secondary(rgb : vec3<f32>) -> vec3<f32> {
+  let center = u.grade_ext0.w;
+  let halfWidth = u.grade_ext1.x;
+  let softness = max(u.grade_ext1.y, 1e-4);
+  let hueShift = u.grade_ext1.z;
+  let satScale = u.grade_ext1.w;
+  let lumScale = u.grade_ext2.x;
+
+  let hsl = rgb_to_hsl(rgb);
+  let dist = hue_dist(hsl.x, center);
+  // 1 inside the band, ramping to 0 across the softness feather. Weight by
+  // saturation so near-greys (undefined hue) are excluded.
+  let sel = (1.0 - smoothstep(halfWidth, halfWidth + softness, dist)) * smoothstep(0.02, 0.15, hsl.y);
+  if (sel <= 1e-4) {
+    return rgb;
+  }
+  var out_hsl = hsl;
+  out_hsl.x = fract(hsl.x + hueShift * sel);
+  out_hsl.y = clamp(hsl.y * mix(1.0, satScale, sel), 0.0, 1.0);
+  out_hsl.z = clamp(hsl.z * mix(1.0, lumScale, sel), 0.0, 1.0);
+  return hsl_to_rgb(out_hsl);
+}
+
 fn apply_grade(rgb : vec3<f32>) -> vec3<f32> {
   let lift = u.grade_lift.xyz;
   let gamma = max(u.grade_gamma.xyz, vec3<f32>(1e-3));
@@ -167,6 +255,31 @@ fn apply_grade(rgb : vec3<f32>) -> vec3<f32> {
   let luma = dot(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
   c = mix(vec3<f32>(luma), c, saturation);
   c = c + vec3<f32>(temperature, tint, -temperature);
+  c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+
+  // Tone curves (#42): per-channel lookup into the baked 256×1 LUT.
+  if (u.grade_ext0.x > 0.5) {
+    c = vec3<f32>(
+      textureSampleLevel(curve_lut_tex, linear_sampler, vec2<f32>(c.r, 0.5), 0.0).r,
+      textureSampleLevel(curve_lut_tex, linear_sampler, vec2<f32>(c.g, 0.5), 0.0).g,
+      textureSampleLevel(curve_lut_tex, linear_sampler, vec2<f32>(c.b, 0.5), 0.0).b,
+    );
+  }
+
+  // HSL secondary (#43).
+  if (u.grade_ext0.z > 0.5) {
+    c = apply_hsl_secondary(c);
+  }
+
+  // 3D LUT (#44): sample the volume with half-texel-corrected coordinates.
+  if (u.grade_ext0.y > 0.5) {
+    let n = max(u.grade_ext2.y, 2.0);
+    let scale = (n - 1.0) / n;
+    let offset = 0.5 / n;
+    let uvw = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)) * scale + vec3<f32>(offset);
+    c = textureSampleLevel(lut3d_tex, linear_sampler, uvw, 0.0).rgb;
+  }
+
   return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
@@ -223,8 +336,8 @@ fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VertexOutput {
 // Uniform packing
 // ---------------------------------------------------------------------------
 
-/** Bytes in the CorridorKeyUniforms block (7 x vec4<f32>). */
-export const CORRIDOR_KEY_UNIFORM_SIZE = 112;
+/** Bytes in the CorridorKeyUniforms block (10 x vec4<f32>). */
+export const CORRIDOR_KEY_UNIFORM_SIZE = 160;
 
 /**
  * Pack params into a Float32Array laid out exactly as the WGSL uniform struct.
@@ -237,6 +350,7 @@ export const packCorridorKeyUniforms = (
   frameWidth: number,
   frameHeight: number,
   grade?: ColorGrade | null,
+  lut3dSize?: number,
 ): Float32Array => {
   const data = new Float32Array(CORRIDOR_KEY_UNIFORM_SIZE / 4);
   data[0] = params.keyColor[0];
@@ -274,6 +388,26 @@ export const packCorridorKeyUniforms = (
   data[25] = g ? g.temperature : 0;
   data[26] = g ? g.tint : 0;
   data[27] = 0;
+
+  // grade_ext0 (curves enabled, 3D LUT enabled, HSL enabled, HSL center hue 0..1)
+  const curvesOn = g && g.curves && !isIdentityCurves(g.curves) ? 1 : 0;
+  const lutOn = g && g.lut3dId ? 1 : 0;
+  const hsl = g?.hsl;
+  const hslOn = hsl && !isIdentityHsl(hsl) ? 1 : 0;
+  data[28] = curvesOn;
+  data[29] = lutOn;
+  data[30] = hslOn;
+  data[31] = hsl ? (((hsl.centerHue % 360) + 360) % 360) / 360 : 0.5;
+  // grade_ext1 (HSL half-width, softness, hue shift, sat scale) — all in turns.
+  data[32] = hsl ? hsl.hueWidth / 360 : 0;
+  data[33] = hsl ? hsl.softness / 360 : 0;
+  data[34] = hsl ? hsl.hueShift / 360 : 0;
+  data[35] = hsl ? hsl.satScale : 1;
+  // grade_ext2 (HSL lum scale, 3D LUT size, unused, unused)
+  data[36] = hsl ? hsl.lumScale : 1;
+  data[37] = lut3dSize ?? 2;
+  data[38] = 0;
+  data[39] = 0;
   return data;
 };
 
@@ -290,6 +424,10 @@ export interface CorridorKeyPassResources {
   readonly bindGroupLayout: GPUBindGroupLayout;
   /** 1x1 opaque-white fallback bound when no ONNX matte is streaming. */
   readonly fallbackMatteTexture: GPUTexture;
+  /** 256×1 identity ramp bound when a layer has no active tone curves. */
+  readonly fallbackCurveLut: GPUTexture;
+  /** 2×2×2 identity cube bound when a layer has no active 3D LUT. */
+  readonly fallbackLut3d: GPUTexture;
   destroy(): void;
 }
 
@@ -329,6 +467,8 @@ export const createCorridorKeyPass = (
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+      { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
     ],
   });
 
@@ -397,6 +537,13 @@ export const createCorridorKeyPass = (
     { width: 1, height: 1 },
   );
 
+  const fallbackCurveLut = createCurveLutTexture(device);
+  writeCurveLutTexture(device, fallbackCurveLut, identityCurveLut());
+
+  const identity3d = identityLut3D();
+  const fallbackLut3d = createLut3dTexture(device, identity3d.size);
+  writeLut3dTexture(device, fallbackLut3d, identity3d.size, identity3d.data);
+
   return {
     pipeline,
     pipelines,
@@ -404,11 +551,63 @@ export const createCorridorKeyPass = (
     sampler,
     bindGroupLayout,
     fallbackMatteTexture,
+    fallbackCurveLut,
+    fallbackLut3d,
     destroy() {
       uniformBuffer.destroy();
       fallbackMatteTexture.destroy();
+      fallbackCurveLut.destroy();
+      fallbackLut3d.destroy();
     },
   };
+};
+
+// ---------------------------------------------------------------------------
+// LUT texture helpers (shared by the compositor for per-layer grade LUTs)
+// ---------------------------------------------------------------------------
+
+/** Allocate the 256×1 RGBA8 texture that holds a baked tone-curve LUT. */
+export const createCurveLutTexture = (device: GPUDevice): GPUTexture =>
+  device.createTexture({
+    label: "grade-curve-lut",
+    size: { width: 256, height: 1 },
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+
+/** Upload a baked 256×4 curve LUT (from bakeCurveLut) into its texture. */
+export const writeCurveLutTexture = (device: GPUDevice, texture: GPUTexture, data: Uint8Array): void => {
+  device.queue.writeTexture(
+    { texture },
+    data,
+    { bytesPerRow: 256 * 4, rowsPerImage: 1 },
+    { width: 256, height: 1 },
+  );
+};
+
+/** Allocate an N×N×N RGBA8 3D texture for a parsed .cube LUT. */
+export const createLut3dTexture = (device: GPUDevice, size: number): GPUTexture =>
+  device.createTexture({
+    label: "grade-lut3d",
+    dimension: "3d",
+    size: { width: size, height: size, depthOrArrayLayers: size },
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+
+/** Upload a parsed 3D LUT (red-fastest RGBA8) into its volume texture. */
+export const writeLut3dTexture = (
+  device: GPUDevice,
+  texture: GPUTexture,
+  size: number,
+  data: Uint8Array,
+): void => {
+  device.queue.writeTexture(
+    { texture },
+    data,
+    { bytesPerRow: size * 4, rowsPerImage: size },
+    { width: size, height: size, depthOrArrayLayers: size },
+  );
 };
 
 /**
