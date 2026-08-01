@@ -8,9 +8,10 @@
  *  └──────────────────────────────────────────────────────────────┘
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
+  BarChart3,
   Captions,
   Circle,
   Clapperboard,
@@ -53,6 +54,7 @@ import {
   defaultCorridorKeyParams,
   framesToTimecode,
   GRADIENT_PRESETS,
+  identityGrade,
   identityTransform,
   makeShapeItem,
   makeStickerItem,
@@ -62,6 +64,7 @@ import {
   type BezierHandles,
   type BlendMode,
   type ClipItem,
+  type ColorGrade,
   type CorridorKeyParams,
   type Effect,
   type EffectId,
@@ -883,6 +886,87 @@ const ClipSection = ({ item, updateItem }: { item: TrackItem; updateItem: Update
   );
 };
 
+/** RGB triple of sliders for one lift/gamma/gain wheel channel. */
+const GradeTriple = ({
+  label,
+  value,
+  min,
+  max,
+  center,
+  onChange,
+}: {
+  label: string;
+  value: readonly [number, number, number];
+  min: number;
+  max: number;
+  center: number;
+  onChange: (next: [number, number, number]) => void;
+}) => {
+  const channels: ReadonlyArray<{ i: number; tint: string }> = [
+    { i: 0, tint: "accent-red-400" },
+    { i: 1, tint: "accent-emerald-400" },
+    { i: 2, tint: "accent-blue-400" },
+  ];
+  return (
+    <div className="mb-1.5">
+      <div className="mb-0.5 flex justify-between text-[9px] uppercase tracking-wide text-neutral-500">
+        <span>{label}</span>
+        <span className="font-mono text-neutral-600">
+          {value.map((v) => v.toFixed(2)).join(" ")}
+        </span>
+      </div>
+      {channels.map(({ i, tint }) => (
+        <input
+          key={i}
+          type="range"
+          min={min}
+          max={max}
+          step={0.01}
+          value={value[i]}
+          onDoubleClick={() => {
+            const next: [number, number, number] = [...value] as [number, number, number];
+            next[i] = center;
+            onChange(next);
+          }}
+          onChange={(event) => {
+            const next: [number, number, number] = [...value] as [number, number, number];
+            next[i] = Number(event.target.value);
+            onChange(next);
+          }}
+          className={`mb-0.5 h-1 w-full cursor-pointer appearance-none rounded bg-panel-raised ${tint}`}
+        />
+      ))}
+    </div>
+  );
+};
+
+const ColorSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
+  if (item.type !== "clip") return null;
+  const grade: ColorGrade = item.grade ?? identityGrade();
+  const setGrade = (patch: Partial<ColorGrade>) =>
+    updateItem(item.id, (it) => (it.type === "clip" ? { ...it, grade: { ...grade, ...patch } } : it), "grade");
+  return (
+    <Section title="Color">
+      <GradeTriple label="Lift (shadows)" value={grade.lift} min={-0.5} max={0.5} center={0} onChange={(lift) => setGrade({ lift })} />
+      <GradeTriple label="Gamma (mids)" value={grade.gamma} min={0.2} max={2.5} center={1} onChange={(gamma) => setGrade({ gamma })} />
+      <GradeTriple label="Gain (highlights)" value={grade.gain} min={0} max={2.5} center={1} onChange={(gain) => setGrade({ gain })} />
+      <div className="mt-1 border-t border-edge/60 pt-1">
+        <SliderRow label="Brightness" value={grade.brightness} min={-0.5} max={0.5} step={0.01} onChange={(v) => setGrade({ brightness: v })} />
+        <SliderRow label="Contrast" value={grade.contrast} min={0} max={2} step={0.01} onChange={(v) => setGrade({ contrast: v })} />
+        <SliderRow label="Saturation" value={grade.saturation} min={0} max={2} step={0.01} onChange={(v) => setGrade({ saturation: v })} />
+        <SliderRow label="Temperature" value={grade.temperature} min={-0.3} max={0.3} step={0.005} onChange={(v) => setGrade({ temperature: v })} />
+        <SliderRow label="Tint" value={grade.tint} min={-0.3} max={0.3} step={0.005} onChange={(v) => setGrade({ tint: v })} />
+      </div>
+      <button
+        onClick={() => updateItem(item.id, (it) => (it.type === "clip" ? { ...it, grade: undefined } : it), "grade")}
+        className="mt-1 w-full rounded border border-edge px-2 py-0.5 text-[10px] text-neutral-400 hover:border-accent/60"
+      >
+        Reset grade
+      </button>
+    </Section>
+  );
+};
+
 const ProjectSettingsSection = () => {
   const settings = useTimelineStore((state) => state.project.settings);
   const setProjectSettings = useTimelineStore((state) => state.setProjectSettings);
@@ -1005,6 +1089,7 @@ const Inspector = () => {
             <TextSection item={selectedItem} updateItem={updateItem} />
             <ShapeSection item={selectedItem} updateItem={updateItem} />
             <ClipSection item={selectedItem} updateItem={updateItem} />
+            <ColorSection item={selectedItem} updateItem={updateItem} />
             <BlendSection item={selectedItem} updateItem={updateItem} />
 
             {selectedItem.type === "clip" && (
@@ -1119,6 +1204,149 @@ const PanelTitle = ({ icon, title }: { icon: React.ReactNode; title: string }) =
     {title.toUpperCase()}
   </div>
 );
+
+// ---------------------------------------------------------------------------
+// Video scopes (histogram / waveform / vectorscope)
+// ---------------------------------------------------------------------------
+
+type ScopeMode = "histogram" | "waveform" | "vectorscope";
+
+const drawScope = (canvas: HTMLCanvasElement, img: ImageData, mode: ScopeMode): void => {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.fillStyle = "#0a0c10";
+  ctx.fillRect(0, 0, W, H);
+  const { data, width: sw, height: sh } = img;
+
+  if (mode === "histogram") {
+    const bins = 256;
+    const r = new Float32Array(bins);
+    const g = new Float32Array(bins);
+    const b = new Float32Array(bins);
+    for (let i = 0; i < data.length; i += 4) {
+      r[data[i]]++;
+      g[data[i + 1]]++;
+      b[data[i + 2]]++;
+    }
+    const max = Math.max(...r, ...g, ...b, 1);
+    const chans: Array<[Float32Array, string]> = [
+      [r, "rgba(255,80,80,0.8)"],
+      [g, "rgba(80,255,120,0.8)"],
+      [b, "rgba(90,140,255,0.8)"],
+    ];
+    ctx.globalCompositeOperation = "lighter";
+    for (const [arr, color] of chans) {
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      for (let x = 0; x < bins; x++) {
+        const px = (x / (bins - 1)) * W;
+        const py = H - (arr[x] / max) * H;
+        if (x === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    }
+    ctx.globalCompositeOperation = "source-over";
+    return;
+  }
+
+  if (mode === "waveform") {
+    // Luma waveform: x = source column, y = brightness (top = white).
+    const image = ctx.getImageData(0, 0, W, H);
+    for (let sx = 0; sx < sw; sx++) {
+      const dx = Math.floor((sx / sw) * W);
+      for (let sy = 0; sy < sh; sy++) {
+        const i = (sy * sw + sx) * 4;
+        const luma = (data[i] * 0.2126 + data[i + 1] * 0.7152 + data[i + 2] * 0.0722) / 255;
+        const dy = Math.floor((1 - luma) * (H - 1));
+        const di = (dy * W + dx) * 4;
+        image.data[di] = Math.min(255, image.data[di] + 40);
+        image.data[di + 1] = Math.min(255, image.data[di + 1] + 80);
+        image.data[di + 2] = Math.min(255, image.data[di + 2] + 40);
+        image.data[di + 3] = 255;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+    return;
+  }
+
+  // Vectorscope: plot BT.709 chroma (Cb, Cr) around the center.
+  const cx = W / 2;
+  const cy = H / 2;
+  ctx.strokeStyle = "#20262f";
+  ctx.beginPath();
+  ctx.arc(cx, cy, Math.min(W, H) / 2 - 2, 0, Math.PI * 2);
+  ctx.stroke();
+  const image = ctx.getImageData(0, 0, W, H);
+  const scale = (Math.min(W, H) / 2 - 2) * 2;
+  for (let i = 0; i < data.length; i += 16) {
+    const rr = data[i] / 255;
+    const gg = data[i + 1] / 255;
+    const bb = data[i + 2] / 255;
+    const cb = -0.114572 * rr - 0.385428 * gg + 0.5 * bb;
+    const cr = 0.5 * rr - 0.454153 * gg - 0.045847 * bb;
+    const px = Math.floor(cx + cb * scale);
+    const py = Math.floor(cy - cr * scale);
+    if (px < 0 || px >= W || py < 0 || py >= H) continue;
+    const di = (py * W + px) * 4;
+    image.data[di] = Math.min(255, image.data[di] + 60);
+    image.data[di + 1] = Math.min(255, image.data[di + 1] + 90);
+    image.data[di + 2] = Math.min(255, image.data[di + 2] + 60);
+    image.data[di + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+};
+
+const ScopesPanel = ({ onClose }: { onClose: () => void }) => {
+  const [mode, setMode] = useState<ScopeMode>("histogram");
+  const displayRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    let raf = 0;
+    const sample = document.createElement("canvas");
+    sample.width = 240;
+    sample.height = 135;
+    const sctx = sample.getContext("2d", { willReadFrequently: true });
+    const loop = () => {
+      const preview = document.querySelector<HTMLCanvasElement>("canvas[data-webcut-preview]");
+      const display = displayRef.current;
+      if (preview && sctx && display && preview.width > 0) {
+        try {
+          sctx.drawImage(preview, 0, 0, sample.width, sample.height);
+          drawScope(display, sctx.getImageData(0, 0, sample.width, sample.height), mode);
+        } catch {
+          /* WebGPU canvas readback can fail transiently — skip this frame */
+        }
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [mode]);
+
+  return (
+    <Modal title="SCOPES" icon={<Activity size={14} className="text-accent" />} onClose={onClose}>
+      <div className="mb-3 flex gap-1">
+        {(["histogram", "waveform", "vectorscope"] as const).map((m) => (
+          <button
+            key={m}
+            onClick={() => setMode(m)}
+            className={`flex-1 rounded px-2 py-1 text-[10px] capitalize ${
+              mode === m ? "bg-accent/25 text-accent" : "text-neutral-400 hover:bg-panel-raised"
+            }`}
+          >
+            {m}
+          </button>
+        ))}
+      </div>
+      <canvas ref={displayRef} width={256} height={256} className="w-full rounded border border-edge bg-black" />
+      <p className="mt-2 text-[10px] leading-relaxed text-neutral-600">
+        Live readout of the composited preview. Adjust a clip's grade and watch the trace respond.
+      </p>
+    </Modal>
+  );
+};
 
 // ---------------------------------------------------------------------------
 // Diagnostics panel
@@ -1458,7 +1686,7 @@ export const MainLayout = () => {
   const frameRate = useTimelineStore((state) => state.project.settings.frameRate);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [showDiag, setShowDiag] = useState(false);
-  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects">(null);
+  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes">(null);
 
   const flashStatus = useCallback((message: string) => {
     setStatusMessage(message);
@@ -1559,6 +1787,9 @@ export const MainLayout = () => {
         <button onClick={() => setModal("subtitles")} title="Subtitles" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
           <Captions size={12} />
         </button>
+        <button onClick={() => setModal("scopes")} title="Scopes" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
+          <BarChart3 size={12} />
+        </button>
         <button
           onClick={() => setShowDiag(true)}
           title="Diagnostics"
@@ -1600,6 +1831,7 @@ export const MainLayout = () => {
 
       {showDiag && <DiagnosticsPanel onClose={() => setShowDiag(false)} />}
       {modal === "subtitles" && <SubtitlesPanel onClose={() => setModal(null)} />}
+      {modal === "scopes" && <ScopesPanel onClose={() => setModal(null)} />}
       {modal === "sounds" && <SoundsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "projects" && <ProjectsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
     </div>

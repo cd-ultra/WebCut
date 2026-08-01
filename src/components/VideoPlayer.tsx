@@ -35,6 +35,7 @@ import {
   sampleAnimatable,
   staticValue,
   type BlendMode,
+  type ColorGrade,
   type CorridorKeyParams,
   type TrackItem,
   type TrackItemId,
@@ -109,6 +110,7 @@ class WebGPUCompositor {
         order,
         hasFrame: false,
         blendMode: "normal",
+        grade: null,
       };
       this.layers.set(layerId, layer);
     }
@@ -120,6 +122,12 @@ class WebGPUCompositor {
     if (this.destroyed) return;
     const layer = this.ensureLayer(layerId, this.layers.get(layerId)?.order ?? 0);
     layer.blendMode = mode;
+  }
+
+  setLayerGrade(layerId: string, grade: ColorGrade | null): void {
+    if (this.destroyed) return;
+    const layer = this.ensureLayer(layerId, this.layers.get(layerId)?.order ?? 0);
+    layer.grade = grade;
   }
 
   /** Drop layers whose tracks no longer have a clip under the playhead. */
@@ -206,6 +214,7 @@ class WebGPUCompositor {
           layer.enabled ? layer.params : { ...layer.params, similarity: -1, smoothness: 0.0001 },
           layer.width,
           layer.height,
+          layer.grade,
         ),
       );
     }
@@ -273,6 +282,7 @@ interface LayerState {
   order: number;
   hasFrame: boolean;
   blendMode: BlendMode;
+  grade: ColorGrade | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +544,7 @@ export const VideoPlayer = () => {
       >
         <canvas
           ref={canvasRef}
+          data-webcut-preview=""
           className="block max-h-full max-w-full object-contain"
           style={{ aspectRatio: `${settings.width} / ${settings.height}` }}
         />

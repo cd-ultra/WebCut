@@ -17,7 +17,7 @@
  * `useNeuralMatte` simply gates the blend in the shader.
  */
 
-import type { BlendMode, CorridorKeyParams } from "../types/timeline";
+import { isIdentityGrade, type BlendMode, type ColorGrade, type CorridorKeyParams } from "../types/timeline";
 
 // ---------------------------------------------------------------------------
 // WGSL
@@ -31,6 +31,14 @@ struct CorridorKeyUniforms {
   matte_params : vec4<f32>,
   // x = neural matte mix, y = use neural matte (0/1), zw = texel size (1/w, 1/h)
   neural_params : vec4<f32>,
+  // xyz = grade lift, w = grade enabled (0/1)
+  grade_lift : vec4<f32>,
+  // xyz = grade gamma, w = brightness
+  grade_gamma : vec4<f32>,
+  // xyz = grade gain, w = contrast
+  grade_gain : vec4<f32>,
+  // x = saturation, y = temperature, z = tint, w = unused
+  grade_misc : vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> u : CorridorKeyUniforms;
@@ -139,6 +147,29 @@ fn suppress_spill(rgb : vec3<f32>, matte : f32) -> vec3<f32> {
   return mix(rgb, out_rgb, mix_amount);
 }
 
+// Primary color grade: ASC-CDL-style lift/gamma/gain, then brightness/contrast,
+// saturation, and a simple temperature/tint white balance. Identity params
+// (lift 0, gamma 1, gain 1, brightness 0, contrast 1, saturation 1, temp/tint 0)
+// leave the color unchanged; the caller gates this with grade_lift.w.
+fn apply_grade(rgb : vec3<f32>) -> vec3<f32> {
+  let lift = u.grade_lift.xyz;
+  let gamma = max(u.grade_gamma.xyz, vec3<f32>(1e-3));
+  let gain = u.grade_gain.xyz;
+  let brightness = u.grade_gamma.w;
+  let contrast = u.grade_gain.w;
+  let saturation = u.grade_misc.x;
+  let temperature = u.grade_misc.y;
+  let tint = u.grade_misc.z;
+
+  var c = clamp(rgb * gain + lift, vec3<f32>(0.0), vec3<f32>(1.0));
+  c = pow(c, vec3<f32>(1.0) / gamma);
+  c = (c - vec3<f32>(0.5)) * contrast + vec3<f32>(0.5) + vec3<f32>(brightness);
+  let luma = dot(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
+  c = mix(vec3<f32>(luma), c, saturation);
+  c = c + vec3<f32>(temperature, tint, -temperature);
+  return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 struct FragmentInput {
   @location(0) uv : vec2<f32>,
 };
@@ -159,10 +190,13 @@ fn fs_corridor_key(input : FragmentInput) -> @location(0) vec4<f32> {
     matte = mix(matte, fused, u.neural_params.x);
   }
 
-  let suppressed = suppress_spill(src.rgb, matte);
+  var graded = suppress_spill(src.rgb, matte);
+  if (u.grade_lift.w > 0.5) {
+    graded = apply_grade(graded);
+  }
 
   // Premultiplied alpha out — required for correct compositor blending.
-  return vec4<f32>(suppressed * matte, matte * src.a);
+  return vec4<f32>(graded * matte, matte * src.a);
 }
 `;
 
@@ -189,17 +223,20 @@ fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VertexOutput {
 // Uniform packing
 // ---------------------------------------------------------------------------
 
-/** Bytes in the CorridorKeyUniforms block (3 x vec4<f32>). */
-export const CORRIDOR_KEY_UNIFORM_SIZE = 48;
+/** Bytes in the CorridorKeyUniforms block (7 x vec4<f32>). */
+export const CORRIDOR_KEY_UNIFORM_SIZE = 112;
 
 /**
  * Pack params into a Float32Array laid out exactly as the WGSL uniform struct.
- * Call once per parameter change, then `queue.writeBuffer` the result.
+ * Call once per parameter change, then `queue.writeBuffer` the result. When
+ * `grade` is omitted the grade is identity and disabled (byte-for-byte the same
+ * output as before grading existed).
  */
 export const packCorridorKeyUniforms = (
   params: CorridorKeyParams,
   frameWidth: number,
   frameHeight: number,
+  grade?: ColorGrade | null,
 ): Float32Array => {
   const data = new Float32Array(CORRIDOR_KEY_UNIFORM_SIZE / 4);
   data[0] = params.keyColor[0];
@@ -214,6 +251,29 @@ export const packCorridorKeyUniforms = (
   data[9] = params.useNeuralMatte ? 1 : 0;
   data[10] = frameWidth > 0 ? 1 / frameWidth : 0;
   data[11] = frameHeight > 0 ? 1 / frameHeight : 0;
+
+  // grade_lift (xyz lift, w enabled)
+  const g = grade ?? null;
+  const enabled = g && !isIdentityGrade(g) ? 1 : 0;
+  data[12] = g ? g.lift[0] : 0;
+  data[13] = g ? g.lift[1] : 0;
+  data[14] = g ? g.lift[2] : 0;
+  data[15] = enabled;
+  // grade_gamma (xyz gamma, w brightness)
+  data[16] = g ? g.gamma[0] : 1;
+  data[17] = g ? g.gamma[1] : 1;
+  data[18] = g ? g.gamma[2] : 1;
+  data[19] = g ? g.brightness : 0;
+  // grade_gain (xyz gain, w contrast)
+  data[20] = g ? g.gain[0] : 1;
+  data[21] = g ? g.gain[1] : 1;
+  data[22] = g ? g.gain[2] : 1;
+  data[23] = g ? g.contrast : 1;
+  // grade_misc (saturation, temperature, tint, unused)
+  data[24] = g ? g.saturation : 1;
+  data[25] = g ? g.temperature : 0;
+  data[26] = g ? g.tint : 0;
+  data[27] = 0;
   return data;
 };
 
