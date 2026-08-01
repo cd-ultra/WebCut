@@ -38,7 +38,7 @@ import {
   type Vec2,
 } from "../types/timeline";
 
-interface SampledTransform {
+export interface SampledTransform {
   readonly pos: Vec2;
   readonly scale: Vec2;
   readonly rotation: number;
@@ -61,7 +61,7 @@ type RVFCVideo = HTMLVideoElement & {
 
 const EMPTY_VIDEO_SET: ReadonlySet<RVFCVideo> = new Set();
 
-interface ActiveLayerClip {
+export interface ActiveLayerClip {
   readonly clip: ClipItem;
   readonly asset: MediaAsset;
   readonly trackId: string;
@@ -72,7 +72,7 @@ interface ActiveLayerClip {
   readonly order: number;
 }
 
-interface ActiveOverlay {
+export interface ActiveOverlay {
   readonly item: OverlayItem;
   /** Own layer id (per-item, so multiple overlays can share a track). */
   readonly layerId: string;
@@ -82,7 +82,7 @@ interface ActiveOverlay {
 /** Max playhead/element drift before a hard re-seek during playback (seconds). */
 const DRIFT_TOLERANCE_S = 0.12;
 
-const resolveActiveClips = (project: Project, frame: number): ActiveLayerClip[] => {
+export const resolveActiveClips = (project: Project, frame: number): ActiveLayerClip[] => {
   const wholeFrame = Math.floor(frame);
   // Every visible video track contributes one layer, bottom (index 0) first;
   // upper layers composite over lower ones with premultiplied alpha, so a
@@ -105,7 +105,7 @@ const resolveActiveClips = (project: Project, frame: number): ActiveLayerClip[] 
 };
 
 /** Text/shape overlays under the playhead, each its own compositing layer. */
-const resolveActiveOverlays = (project: Project, frame: number): ActiveOverlay[] => {
+export const resolveActiveOverlays = (project: Project, frame: number): ActiveOverlay[] => {
   const wholeFrame = Math.floor(frame);
   const overlays: ActiveOverlay[] = [];
   const visualTracks = project.tracks
@@ -125,9 +125,9 @@ const resolveActiveOverlays = (project: Project, frame: number): ActiveOverlay[]
 };
 
 /** Linear gain [0,1] from a dB value, clamped to what an <audio> element allows. */
-const dbToVolume = (gainDb: number): number => Math.min(1, Math.max(0, Math.pow(10, gainDb / 20)));
+export const dbToVolume = (gainDb: number): number => Math.min(1, Math.max(0, Math.pow(10, gainDb / 20)));
 
-const corridorKeyOf = (clip: ClipItem): { enabled: boolean; params: CorridorKeyParams } => {
+export const corridorKeyOf = (clip: ClipItem): { enabled: boolean; params: CorridorKeyParams } => {
   const effect = clip.effects.find((candidate) => candidate.type === "corridor-key");
   if (effect && effect.type === "corridor-key") {
     return { enabled: effect.enabled, params: effect.params };
@@ -560,7 +560,7 @@ const gradientStyle = (ctx: CanvasRenderingContext2D, gradient: GradientFill, ex
   return grad;
 };
 
-const drawTextItem = (ctx: CanvasRenderingContext2D, item: TextItem): void => {
+export const drawTextItem = (ctx: CanvasRenderingContext2D, item: TextItem): void => {
   const lines = item.text.split("\n");
   const lineHeight = item.fontSizePx * item.lineHeight;
   ctx.fillStyle = item.fillGradient
@@ -596,7 +596,7 @@ const backgroundGradientStyle = (
   return grad;
 };
 
-const drawSubtitle = (
+export const drawSubtitle = (
   ctx: CanvasRenderingContext2D,
   w: number,
   h: number,
@@ -629,14 +629,14 @@ const drawSubtitle = (
   });
 };
 
-const drawStickerItem = (ctx: CanvasRenderingContext2D, item: StickerItem): void => {
+export const drawStickerItem = (ctx: CanvasRenderingContext2D, item: StickerItem): void => {
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.font = `${STICKER_BASE_PX}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", system-ui, sans-serif`;
   ctx.fillText(item.content, 0, 0);
 };
 
-const drawShapeItem = (ctx: CanvasRenderingContext2D, item: ShapeItem, w: number, h: number): void => {
+export const drawShapeItem = (ctx: CanvasRenderingContext2D, item: ShapeItem, w: number, h: number): void => {
   // Shapes carry no explicit size — a base extent (40% of the short side) is
   // scaled by the item's transform for sizing.
   const base = Math.min(w, h) * 0.4;
