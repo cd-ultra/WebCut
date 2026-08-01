@@ -15,6 +15,7 @@ import {
   Captions,
   Circle,
   Clapperboard,
+  Download,
   FileAudio,
   FileVideo,
   FolderOpen,
@@ -93,6 +94,7 @@ import {
 import type { TransformProp } from "../store/timelineStore";
 import { chordFromEvent, COMMANDS, prettyChord, resetBindings, setBinding, useKeymap, type CommandId } from "../store/keymap";
 import { evalCurve, parseCubeLut, registerLut } from "../effects/lut";
+import { exportProject, projectEndFrame, type ExportFormat, type ExportProgress } from "../services/ExportService";
 import { getWaveform } from "../services/waveform";
 import {
   computeDuckingKeyframes,
@@ -1925,6 +1927,164 @@ const ShortcutsPanel = ({ onClose }: { onClose: () => void }) => {
 };
 
 // ---------------------------------------------------------------------------
+// Export dialog (#1)
+// ---------------------------------------------------------------------------
+
+const saveBlob = async (blob: Blob, filename: string): Promise<void> => {
+  const picker = (window as unknown as { showSaveFilePicker?: (o: unknown) => Promise<FileSystemFileHandle> }).showSaveFilePicker;
+  const ext = filename.endsWith(".webm") ? "webm" : "mp4";
+  if (picker) {
+    try {
+      const handle = await picker({
+        suggestedName: filename,
+        types: [{ description: "Video", accept: { [`video/${ext}`]: [`.${ext}`] } }],
+      });
+      const writable = await (handle as unknown as { createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }> }).createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (err) {
+      if ((err as DOMException).name === "AbortError") return;
+      // fall through to anchor download
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+};
+
+const ExportPanel = ({ onClose, onStatus }: { onClose: () => void; onStatus: (msg: string) => void }) => {
+  const project = useTimelineStore((s) => s.project);
+  const [format, setFormat] = useState<ExportFormat>("mp4");
+  const [scale, setScale] = useState(1);
+  const [fps, setFps] = useState(project.settings.frameRate);
+  const [mbps, setMbps] = useState(12);
+  const [progress, setProgress] = useState<ExportProgress | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const width = Math.round((project.settings.width * scale) / 2) * 2;
+  const height = Math.round((project.settings.height * scale) / 2) * 2;
+  const endFrame = projectEndFrame(project);
+  const durationSec = endFrame / project.settings.frameRate;
+
+  const run = async () => {
+    if (endFrame <= 0) {
+      setError("Timeline is empty — add clips before exporting.");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      const { blob, filename } = await exportProject(
+        project,
+        { width, height, frameRate: fps, format, videoBitrate: mbps * 1_000_000, startFrame: 0, endFrame },
+        setProgress,
+        controller.signal,
+      );
+      await saveBlob(blob, filename);
+      onStatus(`Exported ${filename} (${(blob.size / 1e6).toFixed(1)} MB)`);
+      onClose();
+    } catch (err) {
+      if ((err as DOMException).name === "AbortError") {
+        onStatus("Export cancelled");
+        onClose();
+      } else {
+        console.error("[WebCut] export failed:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      setBusy(false);
+      setProgress(null);
+      abortRef.current = null;
+    }
+  };
+
+  const pct = progress ? Math.round((progress.frame / progress.totalFrames) * 100) : 0;
+
+  return (
+    <Modal title="EXPORT VIDEO" icon={<Download size={14} className="text-accent-warm" />} onClose={busy ? () => {} : onClose}>
+      <div className="space-y-3">
+        <div className="grid grid-cols-2 gap-2">
+          <label className="block">
+            <span className="mb-1 block text-[10px] text-neutral-400">Format</span>
+            <select value={format} onChange={(e) => setFormat(e.target.value as ExportFormat)} disabled={busy} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
+              <option value="mp4">MP4 (H.264 / AAC)</option>
+              <option value="webm">WebM (VP9 / Opus)</option>
+            </select>
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-[10px] text-neutral-400">Resolution</span>
+            <select value={scale} onChange={(e) => setScale(Number(e.target.value))} disabled={busy} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
+              <option value={1}>100% ({project.settings.width}×{project.settings.height})</option>
+              <option value={0.75}>75%</option>
+              <option value={0.5}>50%</option>
+            </select>
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-[10px] text-neutral-400">Frame rate</span>
+            <select value={fps} onChange={(e) => setFps(Number(e.target.value))} disabled={busy} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
+              {[24, 25, 30, 50, 60].map((r) => <option key={r} value={r}>{r} fps</option>)}
+            </select>
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-[10px] text-neutral-400">Bitrate</span>
+            <select value={mbps} onChange={(e) => setMbps(Number(e.target.value))} disabled={busy} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
+              {[4, 8, 12, 20, 40].map((m) => <option key={m} value={m}>{m} Mbps</option>)}
+            </select>
+          </label>
+        </div>
+
+        <p className="text-[10px] text-neutral-500">
+          {width}×{height} · {fps} fps · {durationSec.toFixed(1)}s · whole timeline ({endFrame} frames)
+        </p>
+
+        {busy && progress && (
+          <div>
+            <div className="mb-1 flex justify-between text-[10px] text-neutral-400">
+              <span className="capitalize">{progress.phase}…</span>
+              <span className="font-mono">{pct}%</span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded bg-panel-raised">
+              <div className="h-full bg-accent-warm transition-[width]" style={{ width: `${pct}%` }} />
+            </div>
+          </div>
+        )}
+
+        {error && <p className="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[10px] text-red-300">{error}</p>}
+
+        <div className="flex gap-2">
+          {busy ? (
+            <button onClick={() => abortRef.current?.abort()} className="flex-1 rounded border border-edge px-3 py-1.5 text-[11px] text-neutral-300 hover:border-red-500/60">
+              Cancel
+            </button>
+          ) : (
+            <>
+              <button onClick={onClose} className="rounded border border-edge px-3 py-1.5 text-[11px] text-neutral-400 hover:border-accent/60">Close</button>
+              <button onClick={run} className="flex-1 rounded bg-accent-warm/90 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-accent-warm">
+                Export
+              </button>
+            </>
+          )}
+        </div>
+
+        <p className="text-[10px] leading-relaxed text-neutral-600">
+          Renders through the same WebGPU compositor as the preview, encodes with WebCodecs, and mixes
+          all audio tracks (gain, ramps, pan, speed). Export runs slower than realtime — it seeks each
+          source frame for exactness. Requires a Chromium-based browser with WebCodecs.
+        </p>
+      </div>
+    </Modal>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Diagnostics panel
 // ---------------------------------------------------------------------------
 
@@ -2262,7 +2422,7 @@ export const MainLayout = () => {
   const frameRate = useTimelineStore((state) => state.project.settings.frameRate);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [showDiag, setShowDiag] = useState(false);
-  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes" | "mixer" | "shortcuts">(null);
+  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes" | "mixer" | "shortcuts" | "export">(null);
 
   const flashStatus = useCallback((message: string) => {
     setStatusMessage(message);
@@ -2391,6 +2551,12 @@ export const MainLayout = () => {
         >
           <Save size={12} /> Save
         </button>
+        <button
+          onClick={() => setModal("export")}
+          className="flex items-center gap-1.5 rounded bg-accent-warm/90 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-warm"
+        >
+          <Download size={12} /> Export
+        </button>
       </header>
 
       {/* Workspace */}
@@ -2416,6 +2582,7 @@ export const MainLayout = () => {
       {modal === "scopes" && <ScopesPanel onClose={() => setModal(null)} />}
       {modal === "mixer" && <MixerPanel onClose={() => setModal(null)} />}
       {modal === "shortcuts" && <ShortcutsPanel onClose={() => setModal(null)} />}
+      {modal === "export" && <ExportPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "sounds" && <SoundsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "projects" && <ProjectsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
     </div>
