@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "tsc -b && vite build",
+    "validate:wgsl": "node scripts/validate-wgsl.mjs",
+    "build": "node scripts/validate-wgsl.mjs && tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc -b --noEmit"
   },
@@ -28,6 +29,7 @@
     "@webgpu/types": "^0.1.52",
     "tailwindcss": "^4.0.0",
     "typescript": "~5.7.2",
-    "vite": "^6.0.7"
+    "vite": "^6.0.7",
+    "wgsl_reflect": "^1.5.0"
   }
 }
