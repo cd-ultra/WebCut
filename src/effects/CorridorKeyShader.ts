@@ -24,6 +24,7 @@ import {
   type BlendMode,
   type ColorGrade,
   type CorridorKeyParams,
+  type EffectParams,
 } from "../types/timeline";
 import { identityCurveLut, identityLut3D } from "./lut";
 
@@ -53,6 +54,11 @@ struct CorridorKeyUniforms {
   grade_ext1 : vec4<f32>,
   // x = HSL lum scale, y = 3D LUT size, zw = unused
   grade_ext2 : vec4<f32>,
+  // x = transition alpha (0..1), y = transition kind (0=none/1=fade/2=wipeL/3=wipeR/4=wipeU/5=wipeD),
+  // z = transition progress (0..1 across the wipe), w = unused
+  transition : vec4<f32>,
+  // x = brightness delta, y = contrast multiplier, z = blur radius (px), w = sharpen amount
+  effect_params : vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> u : CorridorKeyUniforms;
@@ -288,8 +294,43 @@ struct FragmentInput {
 };
 
 @fragment
+// 9-tap Gaussian blur / unsharp-mask sample of source_tex. When both blur and
+// sharpen are inactive this collapses to a single-tap read.
+fn effect_sample_source(uv : vec2<f32>) -> vec3<f32> {
+  let blur = u.effect_params.z;
+  let sharpen = u.effect_params.w;
+  if (blur < 0.5 && sharpen < 0.01) {
+    return textureSampleLevel(source_tex, linear_sampler, uv, 0.0).rgb;
+  }
+  // texel size from the currently-bound frame dims (neural_params.zw).
+  let texel = u.neural_params.zw;
+  let r = max(blur, 1.0);
+  let offsets = array<vec2<f32>, 9>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>(0.0, -1.0), vec2<f32>(1.0, -1.0),
+    vec2<f32>(-1.0,  0.0), vec2<f32>(0.0,  0.0), vec2<f32>(1.0,  0.0),
+    vec2<f32>(-1.0,  1.0), vec2<f32>(0.0,  1.0), vec2<f32>(1.0,  1.0)
+  );
+  let weights = array<f32, 9>(
+    0.0625, 0.125, 0.0625,
+    0.125,  0.25,  0.125,
+    0.0625, 0.125, 0.0625
+  );
+  var blurred = vec3<f32>(0.0);
+  for (var i = 0u; i < 9u; i = i + 1u) {
+    blurred = blurred + textureSampleLevel(source_tex, linear_sampler, uv + offsets[i] * texel * r, 0.0).rgb * weights[i];
+  }
+  if (blur >= 0.5) {
+    return blurred;
+  }
+  // Unsharp mask: center + amount * (center - blurred)
+  let center = textureSampleLevel(source_tex, linear_sampler, uv, 0.0).rgb;
+  return clamp(center + sharpen * (center - blurred), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+@fragment
 fn fs_corridor_key(input : FragmentInput) -> @location(0) vec4<f32> {
-  let src = textureSampleLevel(source_tex, linear_sampler, input.uv, 0.0);
+  let src_rgb = effect_sample_source(input.uv);
+  let src = vec4<f32>(src_rgb, textureSampleLevel(source_tex, linear_sampler, input.uv, 0.0).a);
   var matte = feathered_matte(input.uv, src.rgb);
 
   // Fuse with the neural matte streamed from the ONNX session. The neural
@@ -308,8 +349,46 @@ fn fs_corridor_key(input : FragmentInput) -> @location(0) vec4<f32> {
     graded = apply_grade(graded);
   }
 
+  // Effect stack (#12): brightness/contrast applied after the grade.
+  let bright = u.effect_params.x;
+  let contrast = u.effect_params.y;
+  if (bright != 0.0 || contrast != 1.0) {
+    graded = clamp((graded - vec3<f32>(0.5)) * contrast + vec3<f32>(0.5) + vec3<f32>(bright), vec3<f32>(0.0), vec3<f32>(1.0));
+  }
+
+  // Transition (#6): fade multiplies alpha; wipes gate the frame along an edge.
+  // The .x carries the fade alpha (or 1.0 when a wipe is active); .y encodes
+  // which wipe kind, .z the progress across it (0..1).
+  var t_alpha = u.transition.x;
+  let kind = u.transition.y;
+  if (kind > 0.5) {
+    let progress = clamp(u.transition.z, 0.0, 1.0);
+    let feather = 0.02;
+    var edge = 0.0;
+    if (kind < 1.5) {
+      // fade — nothing extra to do, alpha already carries the multiplier
+      edge = 1.0;
+    } else if (kind < 2.5) {
+      // wipe-left: reveal advances left→right
+      edge = smoothstep(progress - feather, progress + feather, input.uv.x);
+      edge = 1.0 - edge;
+    } else if (kind < 3.5) {
+      // wipe-right: reveal advances right→left
+      edge = smoothstep(1.0 - progress - feather, 1.0 - progress + feather, input.uv.x);
+    } else if (kind < 4.5) {
+      // wipe-up: reveal advances top→bottom
+      edge = smoothstep(progress - feather, progress + feather, input.uv.y);
+      edge = 1.0 - edge;
+    } else {
+      // wipe-down: reveal advances bottom→top
+      edge = smoothstep(1.0 - progress - feather, 1.0 - progress + feather, input.uv.y);
+    }
+    t_alpha = t_alpha * edge;
+  }
+
+  let final_alpha = matte * src.a * t_alpha;
   // Premultiplied alpha out — required for correct compositor blending.
-  return vec4<f32>(graded * matte, matte * src.a);
+  return vec4<f32>(graded * matte * t_alpha, final_alpha);
 }
 `;
 
@@ -336,8 +415,8 @@ fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VertexOutput {
 // Uniform packing
 // ---------------------------------------------------------------------------
 
-/** Bytes in the CorridorKeyUniforms block (10 x vec4<f32>). */
-export const CORRIDOR_KEY_UNIFORM_SIZE = 160;
+/** Bytes in the CorridorKeyUniforms block (12 x vec4<f32>). */
+export const CORRIDOR_KEY_UNIFORM_SIZE = 192;
 
 /**
  * Pack params into a Float32Array laid out exactly as the WGSL uniform struct.
@@ -345,12 +424,24 @@ export const CORRIDOR_KEY_UNIFORM_SIZE = 160;
  * `grade` is omitted the grade is identity and disabled (byte-for-byte the same
  * output as before grading existed).
  */
+/** Runtime transition state passed into the shader for the current frame. */
+export interface TransitionUniform {
+  /** Alpha multiplier applied to the entire layer (0..1). */
+  readonly alpha: number;
+  /** 0 = none/fade only, 1 = fade explicit, 2 = wipe-left … 5 = wipe-down. */
+  readonly kind: number;
+  /** Wipe progress across the frame [0..1]. Ignored when kind < 2. */
+  readonly progress: number;
+}
+
 export const packCorridorKeyUniforms = (
   params: CorridorKeyParams,
   frameWidth: number,
   frameHeight: number,
   grade?: ColorGrade | null,
   lut3dSize?: number,
+  transition?: TransitionUniform | null,
+  effects?: EffectParams | null,
 ): Float32Array => {
   const data = new Float32Array(CORRIDOR_KEY_UNIFORM_SIZE / 4);
   data[0] = params.keyColor[0];
@@ -408,6 +499,19 @@ export const packCorridorKeyUniforms = (
   data[37] = lut3dSize ?? 2;
   data[38] = 0;
   data[39] = 0;
+
+  // transition (alpha, kind, progress, unused). Identity is alpha=1, kind=0.
+  data[40] = transition?.alpha ?? 1;
+  data[41] = transition?.kind ?? 0;
+  data[42] = transition?.progress ?? 0;
+  data[43] = 0;
+
+  // effect_params (brightness delta, contrast mul, blur radius px, sharpen amount).
+  // Identity is (0, 1, 0, 0).
+  data[44] = effects?.brightnessDelta ?? 0;
+  data[45] = effects?.contrastMul ?? 1;
+  data[46] = effects?.blurRadiusPx ?? 0;
+  data[47] = effects?.sharpenAmount ?? 0;
   return data;
 };
 

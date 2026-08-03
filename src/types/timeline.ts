@@ -266,7 +266,62 @@ export type Effect =
       readonly type: "gaussian-blur";
       readonly enabled: boolean;
       readonly params: { readonly radiusPx: AnimatableValue<number> };
+    }
+  | {
+      readonly id: EffectId;
+      readonly type: "sharpen";
+      readonly enabled: boolean;
+      /** amount 0..3 (multiplier on the unsharp-mask high-pass). */
+      readonly params: { readonly amount: AnimatableValue<number> };
     };
+
+/** Effect kinds selectable from the "Add effect" UI. */
+export type EffectType = Effect["type"];
+
+/**
+ * Reduce a clip's active effects into a single flat set of shader parameters.
+ * Multiple instances of the same effect type sum (radius/amount) or take the
+ * latest value (brightness/contrast). Disabled effects contribute nothing.
+ */
+export interface EffectParams {
+  /** Additive brightness applied AFTER the grade pass (-1..+1). */
+  readonly brightnessDelta: number;
+  /** Multiplicative contrast applied AFTER the grade pass (~0..3, 1 = neutral). */
+  readonly contrastMul: number;
+  /** Total blur radius in pixels (0 = disabled). Clamped at the shader. */
+  readonly blurRadiusPx: number;
+  /** Unsharp-mask amount (0 = disabled). */
+  readonly sharpenAmount: number;
+}
+
+export const identityEffectParams = (): EffectParams => ({
+  brightnessDelta: 0,
+  contrastMul: 1,
+  blurRadiusPx: 0,
+  sharpenAmount: 0,
+});
+
+export const reduceEffects = (effects: readonly Effect[], localFrame: number): EffectParams => {
+  let brightness = 0;
+  let contrast = 1;
+  let blur = 0;
+  let sharpen = 0;
+  for (const e of effects) {
+    if (!e.enabled) continue;
+    if (e.type === "brightness-contrast") {
+      brightness += sampleAnimatable(e.params.brightness, localFrame);
+      contrast *= sampleAnimatable(e.params.contrast, localFrame);
+    } else if (e.type === "gaussian-blur") {
+      blur += Math.max(0, sampleAnimatable(e.params.radiusPx, localFrame));
+    } else if (e.type === "sharpen") {
+      sharpen += Math.max(0, sampleAnimatable(e.params.amount, localFrame));
+    }
+  }
+  return { brightnessDelta: brightness, contrastMul: contrast, blurRadiusPx: blur, sharpenAmount: sharpen };
+};
+
+export const isIdentityEffectParams = (p: EffectParams): boolean =>
+  p.brightnessDelta === 0 && p.contrastMul === 1 && p.blurRadiusPx === 0 && p.sharpenAmount === 0;
 
 // ---------------------------------------------------------------------------
 // Media assets
@@ -340,9 +395,26 @@ interface TrackItemBase {
   readonly blendMode?: BlendMode;
 }
 
+/**
+ * A visual transition applied at a clip edge. `frames` is the transition's
+ * total duration; a crossfade of N frames means the two clips overlap on the
+ * timeline for N frames and the outgoing/incoming alpha ramps across them.
+ * Wipes ramp a directional edge across the frame instead of alpha.
+ */
+export type TransitionKind = "fade" | "wipe-left" | "wipe-right" | "wipe-up" | "wipe-down";
+
+export interface Transition {
+  readonly kind: TransitionKind;
+  readonly frames: number;
+}
+
 export interface ClipItem extends TrackItemBase {
   readonly type: "clip";
   readonly assetId: MediaAssetId;
+  /** Transition applied to this clip's leading edge (overlaps the previous clip). */
+  readonly transitionIn?: Transition;
+  /** Transition applied to this clip's trailing edge (overlaps the next clip). */
+  readonly transitionOut?: Transition;
   /** In-point inside the source media (frames). Supports slip edits. */
   readonly sourceInFrame: number;
   /** Playback rate; 1 = realtime, negative values are reversed playback. */
