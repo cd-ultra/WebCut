@@ -38,6 +38,7 @@ import {
   reduceEffects,
   sampleAnimatable,
   sampleClipSpeed,
+  sampleMaskPoints,
   type ClipItem,
   type MediaAsset,
   type OverlayItem,
@@ -250,7 +251,10 @@ export const exportProject = async (
         compositor.setLayerGrade(layerId, clip.grade ?? null);
         compositor.setLayerTransition(layerId, transition);
         compositor.setLayerEffectParams(layerId, reduceEffects(clip.effects, f - clip.startFrame));
-        compositor.setLayerMask(layerId, clip.mask ?? null);
+        compositor.setLayerMask(
+          layerId,
+          clip.mask ? { ...clip.mask, points: sampleMaskPoints(clip.mask, f - clip.startFrame) } : null,
+        );
         activeIds.push(layerId);
         if (asset.kind === "image") {
           const bmp = await getImage(asset);

@@ -88,8 +88,10 @@ import {
   type MediaAssetId,
   type MediaKind,
   type AnimatableValue,
+  type MaskKeyframe,
   type MaskShape,
   type ShapeItem,
+  type ShapeMask,
   type SubtitleId,
   type TextItem,
   type Track,
@@ -1123,9 +1125,77 @@ const MaskSection = ({ item }: { item: TrackItem }) => {
               {mask.points.length} vertices. Max 16 in this MVP; click on the preview to add/move.
             </p>
           )}
+          <RotoscopeControls clip={clip} mask={mask} />
         </>
       )}
     </Section>
+  );
+};
+
+// Rotoscoping (#60) — mask keyframe management. Extracted from MaskSection to
+// keep that component readable; shares its scope via the passed clip + mask.
+const RotoscopeControls = ({ clip, mask }: { clip: ClipItem; mask: ShapeMask }) => {
+  const setClipMask = useTimelineStore((s) => s.setClipMask);
+  const kfs = mask.keyframes ?? [];
+  const localFrame = Math.max(0, Math.round(transport.getFrame()) - clip.startFrame);
+
+  const addKeyframe = () => {
+    // Vertex count is captured lazily from the FIRST keyframe. Prevent
+    // count drift by requiring subsequent keyframes to match.
+    if (kfs.length > 0 && kfs[0].points.length !== mask.points.length) {
+      alert(`Rotoscope keyframes must all share the same vertex count (${kfs[0].points.length}).`);
+      return;
+    }
+    const next: MaskKeyframe = { frame: localFrame, points: mask.points };
+    const filtered = kfs.filter((k) => k.frame !== localFrame);
+    setClipMask(clip.id, { ...mask, keyframes: [...filtered, next].sort((a, b) => a.frame - b.frame) });
+  };
+  const removeKeyframe = (frame: number) => {
+    const nextKfs = kfs.filter((k) => k.frame !== frame);
+    setClipMask(clip.id, { ...mask, keyframes: nextKfs.length > 0 ? nextKfs : undefined });
+  };
+  const seekTo = (frame: number) => transport.setFrame(clip.startFrame + frame);
+
+  return (
+    <div className="mt-2 border-t border-edge/50 pt-1.5">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-[9px] uppercase tracking-wide text-neutral-500">Rotoscope</span>
+        <button
+          onClick={addKeyframe}
+          className="rounded border border-edge px-1.5 py-0.5 text-[9px] text-neutral-300 hover:border-accent/60"
+        >
+          + Key at playhead
+        </button>
+      </div>
+      {kfs.length === 0 && (
+        <p className="text-[9px] text-neutral-600">
+          Set two or more keyframes to animate the mask shape across frames.
+          Between keys, each vertex tweens linearly.
+        </p>
+      )}
+      {kfs.length > 0 && (
+        <div className="max-h-24 space-y-0.5 overflow-y-auto">
+          {kfs.map((k) => (
+            <div key={k.frame} className="flex items-center gap-1 text-[9px] text-neutral-400">
+              <button
+                onClick={() => seekTo(k.frame)}
+                className="min-w-[42px] rounded border border-edge px-1 py-0.5 font-mono hover:border-accent/60"
+              >
+                f {k.frame}
+              </button>
+              <span className="flex-1 truncate">{k.points.length}v</span>
+              <button
+                onClick={() => removeKeyframe(k.frame)}
+                className="rounded border border-edge px-1 py-0.5 hover:border-red-500/60"
+                title="Remove keyframe"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 };
 

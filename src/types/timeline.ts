@@ -433,6 +433,17 @@ export interface Transition {
  */
 export type MaskShape = "rect" | "ellipse" | "polygon";
 
+/**
+ * Rotoscoping keyframe (#60): a snapshot of the mask's vertex positions at a
+ * specific clip-local frame. Vertex counts must match across keyframes — the
+ * evaluator interpolates each vertex 1:1 by index. `mask.points` acts as the
+ * "current edit" snapshot; it's not consulted for playback when keyframes exist.
+ */
+export interface MaskKeyframe {
+  readonly frame: number;
+  readonly points: readonly Vec2[];
+}
+
 export interface ShapeMask {
   readonly shape: MaskShape;
   readonly points: readonly Vec2[];
@@ -440,6 +451,12 @@ export interface ShapeMask {
   readonly inverted: boolean;
   /** Soft edge, in normalized units (0..0.2 typical). */
   readonly feather: number;
+  /**
+   * Rotoscoping (#60): if present and non-empty, per-frame vertex positions
+   * are interpolated across these snapshots rather than using `points`.
+   * Absent ⇒ static mask (`points`).
+   */
+  readonly keyframes?: readonly MaskKeyframe[];
 }
 
 export const identityRectMask = (): ShapeMask => ({
@@ -829,6 +846,45 @@ export const framesToTimecode = (frame: number, fps: number): string => {
   const hh = Math.floor(totalSeconds / 3600);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(hh)}:${pad(mm)}:${pad(ss)}:${pad(ff)}`;
+};
+
+// ---------------------------------------------------------------------------
+// Rotoscoping keyframe evaluation (#60)
+// ---------------------------------------------------------------------------
+
+/**
+ * Evaluate a mask's per-frame vertex positions. Returns `mask.points` verbatim
+ * when the mask isn't animated. When animated, linearly interpolates each
+ * vertex between neighboring keyframes; before the first or after the last
+ * keyframe, returns that end's snapshot.
+ */
+export const sampleMaskPoints = (mask: ShapeMask, localFrame: number): readonly Vec2[] => {
+  const kfs = mask.keyframes;
+  if (!kfs || kfs.length === 0) return mask.points;
+  if (kfs.length === 1) return kfs[0].points;
+  if (localFrame <= kfs[0].frame) return kfs[0].points;
+  const last = kfs[kfs.length - 1];
+  if (localFrame >= last.frame) return last.points;
+  // Locate the surrounding pair.
+  let lo = 0;
+  let hi = kfs.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (kfs[mid].frame <= localFrame) lo = mid;
+    else hi = mid;
+  }
+  const a = kfs[lo];
+  const b = kfs[hi];
+  const span = b.frame - a.frame;
+  const t = span === 0 ? 0 : (localFrame - a.frame) / span;
+  const n = Math.min(a.points.length, b.points.length);
+  const out: Vec2[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const p = a.points[i];
+    const q = b.points[i];
+    out[i] = { x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t };
+  }
+  return out;
 };
 
 // ---------------------------------------------------------------------------
