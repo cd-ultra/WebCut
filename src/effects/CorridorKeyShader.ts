@@ -309,7 +309,6 @@ struct FragmentInput {
   @location(0) uv : vec2<f32>,
 };
 
-@fragment
 // Get one polygon vertex (up to 16) from the packed uniform array.
 fn polygon_point(idx : u32) -> vec2<f32> {
   // Two vec2 vertices per vec4, so 8 vec4 = 16 vertices.
