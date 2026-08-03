@@ -1371,6 +1371,90 @@ const StabilizeSection = ({ item }: { item: TrackItem }) => {
   );
 };
 
+// ---------------------------------------------------------------------------
+// Multicam (#49): drop a set of angles onto a clip; hard-cut between them.
+// ---------------------------------------------------------------------------
+
+const MulticamSection = ({ item }: { item: TrackItem }) => {
+  const assets = useTimelineStore((s) => s.project.assets);
+  const setClipMulticam = useTimelineStore((s) => s.setClipMulticam);
+  const setMulticamAngleAt = useTimelineStore((s) => s.setMulticamAngleAt);
+  if (item.type !== "clip") return null;
+  const clip = item;
+  const videoAssets = assets.filter((a) => a.kind === "video" || a.kind === "image");
+  const enabled = !!clip.multicam;
+
+  const enable = () => {
+    // Seed with the current clip's asset as the sole angle.
+    setClipMulticam(clip.id, {
+      angles: [clip.assetId],
+      angleSelection: staticValue(0),
+    });
+  };
+  const disable = () => setClipMulticam(clip.id, null);
+
+  const toggleAngle = (assetId: import("../types/timeline").MediaAssetId) => {
+    if (!clip.multicam) return;
+    const current = clip.multicam.angles;
+    const idx = current.indexOf(assetId);
+    const next = idx >= 0 ? current.filter((a) => a !== assetId) : [...current, assetId];
+    if (next.length === 0) { disable(); return; }
+    setClipMulticam(clip.id, { angles: next, angleSelection: clip.multicam.angleSelection });
+  };
+
+  const cutTo = (angleIdx: number) => {
+    if (!clip.multicam) return;
+    const localFrame = Math.max(0, Math.min(clip.durationFrames - 1, Math.round(transport.getFrame()) - clip.startFrame));
+    setMulticamAngleAt(clip.id, localFrame, angleIdx);
+  };
+
+  return (
+    <Section title="Multicam">
+      {!enabled && (
+        <button onClick={enable} className="w-full rounded border border-edge px-2 py-0.5 text-[10px] text-neutral-300 hover:border-accent/60">
+          Enable multicam
+        </button>
+      )}
+      {enabled && clip.multicam && (
+        <>
+          <p className="mb-1 text-[9px] text-neutral-600">
+            Pick angles below, then press 1..N (or click Cut) at the playhead to insert a
+            hard-cut keyframe. Angles must already be aligned on the timeline (drag to sync).
+          </p>
+          <div className="mb-1.5 max-h-32 space-y-0.5 overflow-y-auto pr-1">
+            {videoAssets.map((a) => {
+              const selected = clip.multicam!.angles.includes(a.id);
+              const idx = clip.multicam!.angles.indexOf(a.id);
+              return (
+                <label key={a.id} className={`flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[10px] ${selected ? "bg-accent/10 text-neutral-200" : "text-neutral-400 hover:bg-panel-raised"}`}>
+                  <input type="checkbox" checked={selected} onChange={() => toggleAngle(a.id)} className="accent-(--color-accent)" />
+                  <span className="w-4 text-center font-mono text-[9px] text-neutral-500">{selected ? idx + 1 : "—"}</span>
+                  <span className="min-w-0 flex-1 truncate">{a.name}</span>
+                </label>
+              );
+            })}
+          </div>
+          <div className="mb-1 flex flex-wrap gap-1">
+            {clip.multicam.angles.map((_, idx) => (
+              <button
+                key={idx}
+                onClick={() => cutTo(idx)}
+                className="rounded border border-edge px-1.5 py-0.5 font-mono text-[10px] text-neutral-300 hover:border-accent/60"
+                title={`Cut to angle ${idx + 1} at playhead`}
+              >
+                Cut → {idx + 1}
+              </button>
+            ))}
+          </div>
+          <button onClick={disable} className="w-full rounded border border-edge px-2 py-0.5 text-[10px] text-neutral-400 hover:border-red-500/60">
+            Disable multicam
+          </button>
+        </>
+      )}
+    </Section>
+  );
+};
+
 /** RGB triple of sliders for one lift/gamma/gain wheel channel. */
 const GradeTriple = ({
   label,
@@ -1812,6 +1896,7 @@ const Inspector = () => {
             <TransitionSection item={selectedItem} />
             <SpeedSection item={selectedItem} />
             <StabilizeSection item={selectedItem} />
+            <MulticamSection item={selectedItem} />
             <ColorSection item={selectedItem} updateItem={updateItem} />
             <BlendSection item={selectedItem} updateItem={updateItem} />
 

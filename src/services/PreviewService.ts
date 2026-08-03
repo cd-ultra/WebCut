@@ -125,7 +125,20 @@ export const resolveActiveClips = (project: Project, frame: number): ActiveLayer
 
     for (let i = 0; i < activeClips.length; i++) {
       const clip = activeClips[i];
-      const asset = project.assets.find((candidate) => candidate.id === clip.assetId);
+      // Multicam (#49): pick the active angle by sampling the animatable, else
+      // fall back to the clip's own assetId.
+      let effectiveAssetId = clip.assetId;
+      if (clip.multicam && clip.multicam.angles.length > 0) {
+        const idx = Math.max(
+          0,
+          Math.min(
+            clip.multicam.angles.length - 1,
+            Math.round(sampleAnimatable(clip.multicam.angleSelection, wholeFrame - clip.startFrame)),
+          ),
+        );
+        effectiveAssetId = clip.multicam.angles[idx];
+      }
+      const asset = project.assets.find((candidate) => candidate.id === effectiveAssetId);
       if (!asset || asset.kind === "audio") continue;
 
       // Transition uniform: only set for a pair of overlapping clips where the

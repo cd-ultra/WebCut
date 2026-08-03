@@ -477,6 +477,16 @@ export interface ClipItem extends TrackItemBase {
   readonly grade?: ColorGrade;
   /** Shape mask (#13). Absent ⇒ no mask. */
   readonly mask?: ShapeMask;
+  /**
+   * Multicam angles (#49). When present the resolver samples `angleSelection`
+   * per frame and renders `angles[selection]` instead of `assetId`. The clip's
+   * own `assetId` is used as a fallback / for asset-metadata (duration, etc.).
+   * `angleSelection` uses hold interpolation to make angle cuts hard-switched.
+   */
+  readonly multicam?: {
+    readonly angles: readonly MediaAssetId[];
+    readonly angleSelection: AnimatableValue<number>;
+  };
 }
 
 export interface ShapeItem extends TrackItemBase {
