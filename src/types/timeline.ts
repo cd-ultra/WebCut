@@ -7,6 +7,8 @@
  * floating-point drift during long edits.
  */
 
+import { evaluateExpression, getExpressionFps } from "../expression";
+
 /** Branded ID types prevent cross-assigning identifiers between entities. */
 export type ProjectId = string & { readonly __brand: "ProjectId" };
 export type TrackId = string & { readonly __brand: "TrackId" };
@@ -43,10 +45,16 @@ export interface Keyframe<V = number> {
   readonly bezier?: BezierHandles;
 }
 
-/** An animatable scalar: a static value or a keyframe curve. */
+/**
+ * An animatable scalar: a static value, a keyframe curve, or a scripted
+ * expression (#63). The `expression` variant is only meaningful for numeric
+ * properties (rotation / opacity) — `base` is the fallback exposed to the
+ * expression as `value` and returned on any evaluation error.
+ */
 export type AnimatableValue<V = number> =
   | { readonly kind: "static"; readonly value: V }
-  | { readonly kind: "animated"; readonly keyframes: readonly Keyframe<V>[] };
+  | { readonly kind: "animated"; readonly keyframes: readonly Keyframe<V>[] }
+  | { readonly kind: "expression"; readonly expr: string; readonly base: number };
 
 export const staticValue = <V>(value: V): AnimatableValue<V> => ({ kind: "static", value });
 
@@ -559,12 +567,61 @@ export interface AudioVizItem extends TrackItemBase {
   readonly barCount: number;
 }
 
-export type TrackItem = ClipItem | ShapeItem | TextItem | StickerItem | AudioVizItem;
-export type OverlayItem = TextItem | ShapeItem | StickerItem | AudioVizItem;
+/** Particle system overlay (#64) — a deterministic, seeded emitter. */
+export interface ParticleItem extends TrackItemBase {
+  readonly type: "particles";
+  /** Emitter origin as a fraction of the canvas (0.5,0.5 = center). */
+  readonly originX: number;
+  readonly originY: number;
+  /** Particles spawned per second. */
+  readonly rate: number;
+  /** Particle lifetime in seconds. */
+  readonly lifetime: number;
+  /** Initial speed in px/s and its ± jitter. */
+  readonly speed: number;
+  /** Emission cone: base direction (deg, 0 = up) and spread (deg). */
+  readonly direction: number;
+  readonly spread: number;
+  /** Downward acceleration in px/s². */
+  readonly gravity: number;
+  readonly size: number;
+  readonly color: string;
+  /** Deterministic seed so preview and export produce identical output. */
+  readonly seed: number;
+}
+
+export type TrackItem = ClipItem | ShapeItem | TextItem | StickerItem | AudioVizItem | ParticleItem;
+export type OverlayItem = TextItem | ShapeItem | StickerItem | AudioVizItem | ParticleItem;
 
 /** True for items composited as overlays (rendered from vector/text, not media). */
 export const isOverlayItem = (item: TrackItem): item is OverlayItem =>
-  item.type === "text" || item.type === "shape" || item.type === "sticker" || item.type === "audioviz";
+  item.type === "text" || item.type === "shape" || item.type === "sticker" ||
+  item.type === "audioviz" || item.type === "particles";
+
+/** Factory: a particle emitter overlay with sensible defaults. */
+export const makeParticleItem = (
+  startFrame: number,
+  durationFrames: number,
+): Omit<ParticleItem, "id"> => ({
+  type: "particles",
+  name: "Particles",
+  startFrame,
+  durationFrames,
+  transform: identityTransform(),
+  effects: [],
+  locked: false,
+  originX: 0.5,
+  originY: 0.6,
+  rate: 60,
+  lifetime: 1.6,
+  speed: 260,
+  direction: 0,
+  spread: 40,
+  gravity: 300,
+  size: 8,
+  color: "#ffb15e",
+  seed: Math.floor(Math.random() * 1e6),
+});
 
 /** Factory: an audio waveform visualizer overlay. */
 export const makeAudioVizItem = (
@@ -844,6 +901,17 @@ const lerpValue = <V>(a: V, b: V, t: number): V => {
 /** Sample an animatable value at a local frame (relative to item start). */
 export const sampleAnimatable = <V>(animatable: AnimatableValue<V>, frame: number): V => {
   if (animatable.kind === "static") return animatable.value;
+  if (animatable.kind === "expression") {
+    // Number-only: expressions are wired to scalar props (rotation/opacity).
+    const fps = getExpressionFps();
+    const n = evaluateExpression(animatable.expr, {
+      time: frame / (fps || 30),
+      frame,
+      fps: fps || 30,
+      value: animatable.base,
+    });
+    return n as unknown as V;
+  }
   const keys = animatable.keyframes;
   if (keys.length === 0) {
     throw new Error("Animated value must contain at least one keyframe");

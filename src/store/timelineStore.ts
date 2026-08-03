@@ -237,6 +237,8 @@ export interface TimelineState {
     patch: Partial<Pick<Keyframe<number>, "interpolation" | "bezier">>,
   ): void;
   clearTransformKeyframes(itemId: TrackItemId, prop: TransformProp, localFrame: number): void;
+  /** Scripting (#63): drive a scalar transform prop by an expression, or null to clear. */
+  setTransformExpression(itemId: TrackItemId, prop: "rotation" | "opacity", expr: string | null): void;
   // ripple trim
   trimItemRipple(itemId: TrackItemId, edge: "start" | "end", newFrame: number): void;
   // professional trim tools
@@ -798,6 +800,29 @@ export const useTimelineStore = create<TimelineState>()(
         ),
         revision: state.revision + 1,
         ...pushPast(state),
+      })),
+
+    setTransformExpression: (itemId, prop, expr) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) => {
+          if (item.id !== itemId) return item;
+          const current = asNum(item.transform[prop]);
+          if (expr === null) {
+            // Freeze the currently-evaluated value into a static prop.
+            const base = current.kind === "expression" ? current.base : sampleAnimatable(current, 0);
+            return {
+              ...item,
+              transform: { ...item.transform, [prop]: { kind: "static", value: base } },
+            } as TrackItem;
+          }
+          const base = current.kind === "static" ? current.value : current.kind === "expression" ? current.base : 0;
+          return {
+            ...item,
+            transform: { ...item.transform, [prop]: { kind: "expression", expr, base } },
+          } as TrackItem;
+        }),
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, `expr:${itemId}:${prop}`),
       })),
 
     // -- ripple trim ------------------------------------------------------------

@@ -22,11 +22,13 @@ import { ArrayBufferTarget as Mp4Target, Muxer as Mp4Muxer } from "mp4-muxer";
 import { ArrayBufferTarget as WebmTarget, Muxer as WebmMuxer } from "webm-muxer";
 import { WebGPUCompositor } from "../effects/Compositor";
 import { projectChaptersToWebVtt } from "./chapters";
+import { setExpressionFps } from "../expression";
 import { fileSystemService } from "./FileSystemService";
 import {
   corridorKeyOf,
   dbToVolume,
   drawAudioVizItem,
+  drawParticleItem,
   drawShapeItem,
   drawStickerItem,
   drawSubtitle,
@@ -229,6 +231,7 @@ export const exportProject = async (
     if (item.type === "text") drawTextItem(rctx as unknown as CanvasRenderingContext2D, item);
     else if (item.type === "shape") drawShapeItem(rctx as unknown as CanvasRenderingContext2D, item, width, height);
     else if (item.type === "sticker") drawStickerItem(rctx as unknown as CanvasRenderingContext2D, item);
+    else if (item.type === "particles") drawParticleItem(rctx as unknown as CanvasRenderingContext2D, item, width, height, local, frameRate);
     else {
       const asset = project.assets.find((a) => a.id === item.assetId);
       const peaks = asset ? await getWaveformPeaks(asset) : null;
@@ -241,6 +244,7 @@ export const exportProject = async (
   // --- Video frame loop -----------------------------------------------------
   try {
     const fps = frameRate;
+    setExpressionFps(fps); // #63: expressions read time = frame / fps
     const keyInterval = Math.round(fps * 2); // keyframe every ~2s
     for (let i = 0; i < totalFrames; i++) {
       checkAbort();

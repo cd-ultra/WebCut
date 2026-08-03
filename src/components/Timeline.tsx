@@ -125,6 +125,7 @@ const ITEM_COLORS: Record<TrackItem["type"], string> = {
   text: "bg-[#9e7a2d] border-[#e0b65f]",
   sticker: "bg-[#2d7a5a] border-[#5fe0b0]",
   audioviz: "bg-[#2d6e7a] border-[#5fc8e0]",
+  particles: "bg-[#7a5a2d] border-[#e0b15f]",
 };
 
 /** Canvas waveform overlay for audio-bearing clips. */
