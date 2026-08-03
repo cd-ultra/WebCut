@@ -32,6 +32,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Square,
+  Target,
   Type,
 } from "lucide-react";
 import { VideoPlayer } from "./VideoPlayer";
@@ -113,6 +114,7 @@ import {
   type TemplateValues,
 } from "../services/templates";
 import { getUseProxies, proxyService, setUseProxies, subscribeUseProxies, type ProxyJob } from "../services/ProxyService";
+import { trackPoint, type TrackSample } from "../services/motionTrack";
 import { EXPORT_PRESETS, type ExportPreset } from "../services/ExportPresets";
 import { exportQueue, type ExportJob } from "../services/ExportQueue";
 import { getWaveform } from "../services/waveform";
@@ -2495,6 +2497,180 @@ const ProxyIndicator = () => {
 };
 
 // ---------------------------------------------------------------------------
+// Motion tracking (#59): pick a point on the source frame, LK-track it, and
+// write the result as position keyframes on a chosen overlay.
+// ---------------------------------------------------------------------------
+
+const MotionTrackPanel = ({ onClose, onStatus }: { onClose: () => void; onStatus: (m: string) => void }) => {
+  const project = useTimelineStore((s) => s.project);
+  const selectedItemIds = useTimelineStore((s) => s.selectedItemIds);
+  const updateItem = useTimelineStore((s) => s.updateItem);
+
+  // Pick the currently-selected CLIP as the source, and require exactly one
+  // OVERLAY somewhere in the project to receive the keyframes.
+  const clip = useMemo(() => {
+    for (const track of project.tracks) {
+      for (const item of track.items) {
+        if (item.id === selectedItemIds[0] && item.type === "clip") return item;
+      }
+    }
+    return null;
+  }, [project, selectedItemIds]);
+  const overlays = useMemo(() => {
+    const acc: TrackItem[] = [];
+    for (const track of project.tracks) {
+      for (const item of track.items) {
+        if (item.type === "text" || item.type === "shape" || item.type === "sticker") acc.push(item);
+      }
+    }
+    return acc;
+  }, [project]);
+
+  const asset = clip ? project.assets.find((a) => a.id === clip.assetId) : undefined;
+  const [px, setPx] = useState(asset?.width ? Math.round(asset.width / 2) : 320);
+  const [py, setPy] = useState(asset?.height ? Math.round(asset.height / 2) : 180);
+  const [targetOverlayId, setTargetOverlayId] = useState<string>(overlays[0]?.id ?? "");
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [message, setMessage] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const run = async () => {
+    if (!clip || !asset || asset.kind === "audio") { setMessage("Select a video clip first."); return; }
+    if (!targetOverlayId) { setMessage("Add a text/shape/sticker overlay first."); return; }
+    setBusy(true);
+    setMessage("Tracking…");
+    setProgress(0);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      const samples: TrackSample[] = await trackPoint(
+        asset,
+        clip.sourceInFrame,
+        clip.durationFrames,
+        project.settings.frameRate,
+        { x: px, y: py },
+        (p) => setProgress(Math.round((p.frame / p.totalFrames) * 100)),
+        controller.signal,
+      );
+
+      // Apply as position keyframes on the overlay. Positions are in project
+      // pixels relative to canvas center, so we offset by (asset dim / 2).
+      const w = asset.width ?? project.settings.width;
+      const h = asset.height ?? project.settings.height;
+      const scaleX = project.settings.width / w;
+      const scaleY = project.settings.height / h;
+      const keyframes = samples.map((s) => ({
+        id: createId<KeyframeId>(),
+        frame: s.frame,
+        value: {
+          x: (s.point.x - w / 2) * scaleX,
+          y: (s.point.y - h / 2) * scaleY,
+        },
+        interpolation: "linear" as const,
+      }));
+
+      updateItem(
+        targetOverlayId as unknown as TrackItemId,
+        (it) => ({
+          ...it,
+          transform: {
+            ...it.transform,
+            position: { kind: "animated", keyframes },
+          },
+        }) as unknown as TrackItem,
+        "motiontrack",
+      );
+
+      onStatus(`Motion-tracked ${samples.length} frames → ${overlays.find((o) => o.id === targetOverlayId)?.name}.`);
+      onClose();
+    } catch (err) {
+      if ((err as DOMException).name === "AbortError") setMessage("Cancelled.");
+      else setMessage(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusy(false);
+      abortRef.current = null;
+    }
+  };
+
+  return (
+    <Modal title="MOTION TRACKING" icon={<Target size={14} className="text-accent" />} onClose={onClose} wide>
+      {!clip && (
+        <p className="rounded border border-dashed border-edge/70 p-3 text-[10px] text-neutral-500">
+          Select a video clip on the timeline to track.
+        </p>
+      )}
+      {clip && asset && (
+        <div className="space-y-3">
+          <p className="text-[10px] text-neutral-400">
+            Source: <span className="font-mono text-neutral-200">{asset.name}</span> · {asset.width ?? "?"}×{asset.height ?? "?"} · {clip.durationFrames} frames.
+          </p>
+
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block">
+              <span className="mb-0.5 block text-[10px] text-neutral-400">Start point X (px)</span>
+              <input type="number" value={px} onChange={(e) => setPx(Number(e.target.value))} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200 outline-none" />
+            </label>
+            <label className="block">
+              <span className="mb-0.5 block text-[10px] text-neutral-400">Start point Y (px)</span>
+              <input type="number" value={py} onChange={(e) => setPy(Number(e.target.value))} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200 outline-none" />
+            </label>
+          </div>
+
+          <label className="block">
+            <span className="mb-0.5 block text-[10px] text-neutral-400">Attach tracked position to</span>
+            <select
+              value={targetOverlayId}
+              onChange={(e) => setTargetOverlayId(e.target.value)}
+              className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200"
+            >
+              <option value="">— pick an overlay —</option>
+              {overlays.map((o) => (
+                <option key={o.id} value={o.id}>{o.name} ({o.type})</option>
+              ))}
+            </select>
+          </label>
+
+          {busy && (
+            <div>
+              <div className="mb-0.5 flex justify-between text-[10px] text-neutral-500">
+                <span>Tracking</span>
+                <span className="font-mono">{progress}%</span>
+              </div>
+              <div className="h-1 w-full overflow-hidden rounded bg-panel-raised">
+                <div className="h-full bg-accent transition-[width]" style={{ width: `${progress}%` }} />
+              </div>
+            </div>
+          )}
+          {message && <p className="text-[10px] text-neutral-400">{message}</p>}
+
+          <div className="flex gap-2">
+            {busy ? (
+              <button onClick={() => abortRef.current?.abort()} className="flex-1 rounded border border-edge px-3 py-1.5 text-[11px] text-neutral-300 hover:border-red-500/60">
+                Cancel
+              </button>
+            ) : (
+              <>
+                <button onClick={onClose} className="rounded border border-edge px-3 py-1.5 text-[11px] text-neutral-400 hover:border-accent/60">Close</button>
+                <button onClick={run} className="flex-1 rounded bg-accent/90 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-accent">
+                  Track
+                </button>
+              </>
+            )}
+          </div>
+
+          <p className="text-[10px] leading-relaxed text-neutral-600">
+            Classical Lucas–Kanade optical flow: iteratively aligns a small window around the seed
+            point across frames using two pyramid levels. Deterministic, no ML model needed. Tracked
+            positions land as linear position keyframes on the chosen overlay's transform.
+          </p>
+        </div>
+      )}
+    </Modal>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Motion-graphics templates (#62)
 // ---------------------------------------------------------------------------
 
@@ -3068,7 +3244,7 @@ export const MainLayout = () => {
   const frameRate = useTimelineStore((state) => state.project.settings.frameRate);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [showDiag, setShowDiag] = useState(false);
-  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes" | "mixer" | "shortcuts" | "export" | "templates">(null);
+  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes" | "mixer" | "shortcuts" | "export" | "templates" | "motionTrack">(null);
 
   const flashStatus = useCallback((message: string) => {
     setStatusMessage(message);
@@ -3189,6 +3365,9 @@ export const MainLayout = () => {
         <button onClick={() => setModal("templates")} title="Motion graphics templates" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
           <LayoutTemplate size={12} />
         </button>
+        <button onClick={() => setModal("motionTrack")} title="Motion tracking" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
+          <Target size={12} />
+        </button>
         <ProxyIndicator />
         <button
           onClick={() => setShowDiag(true)}
@@ -3241,6 +3420,7 @@ export const MainLayout = () => {
       {modal === "mixer" && <MixerPanel onClose={() => setModal(null)} />}
       {modal === "shortcuts" && <ShortcutsPanel onClose={() => setModal(null)} />}
       {modal === "templates" && <TemplatesPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
+      {modal === "motionTrack" && <MotionTrackPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "export" && <ExportPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "sounds" && <SoundsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "projects" && <ProjectsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
