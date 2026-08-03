@@ -88,6 +88,7 @@ import {
   type AnimatableValue,
   type MaskShape,
   type ShapeItem,
+  type SubtitleId,
   type TextItem,
   type Track,
   type TrackItem,
@@ -100,6 +101,7 @@ import type { TransformProp } from "../store/timelineStore";
 import { chordFromEvent, COMMANDS, prettyChord, resetBindings, setBinding, useKeymap, type CommandId } from "../store/keymap";
 import { evalCurve, parseCubeLut, registerLut } from "../effects/lut";
 import { projectEndFrame, type ExportFormat } from "../services/ExportService";
+import { segmentsToSubtitleFrames, transcribeProject } from "../services/transcription";
 import { EXPORT_PRESETS, type ExportPreset } from "../services/ExportPresets";
 import { exportQueue, type ExportJob } from "../services/ExportQueue";
 import { getWaveform } from "../services/waveform";
@@ -2536,6 +2538,7 @@ const Modal = ({
 );
 
 const SubtitlesPanel = ({ onClose }: { onClose: () => void }) => {
+  const project = useTimelineStore((s) => s.project);
   const subtitles = useTimelineStore((s) => s.project.subtitles);
   const style = useTimelineStore((s) => s.project.subtitleStyle);
   const fps = useTimelineStore((s) => s.project.settings.frameRate);
@@ -2545,6 +2548,10 @@ const SubtitlesPanel = ({ onClose }: { onClose: () => void }) => {
   const setSubtitles = useTimelineStore((s) => s.setSubtitles);
   const setStyle = useTimelineStore((s) => s.setSubtitleStyle);
   const [importText, setImportText] = useState("");
+  const [transcribing, setTranscribing] = useState(false);
+  const [transcribeMsg, setTranscribeMsg] = useState<string | null>(null);
+  const [transcribePct, setTranscribePct] = useState(0);
+  const transcribeAbort = useRef<AbortController | null>(null);
 
   const exportSrt = () => {
     const blob = new Blob([toSrt(subtitles, fps)], { type: "text/plain" });
@@ -2555,9 +2562,48 @@ const SubtitlesPanel = ({ onClose }: { onClose: () => void }) => {
     URL.revokeObjectURL(a.href);
   };
 
+  const runTranscribe = async () => {
+    const endFrame = projectEndFrame(project);
+    if (endFrame <= 0) { setTranscribeMsg("Timeline is empty."); return; }
+    setTranscribing(true);
+    setTranscribeMsg("Loading model…");
+    setTranscribePct(0);
+    const controller = new AbortController();
+    transcribeAbort.current = controller;
+    try {
+      const { segments } = await transcribeProject(
+        project,
+        { startFrame: 0, endFrame },
+        (p) => {
+          setTranscribeMsg(p.message ?? p.phase);
+          setTranscribePct(Math.round(p.progress * 100));
+        },
+        controller.signal,
+      );
+      if (segments.length === 0) {
+        setTranscribeMsg("No speech detected.");
+      } else {
+        const frames = segmentsToSubtitleFrames(segments, 0, fps);
+        setSubtitles([...subtitles, ...frames.map((f) => ({
+          id: createId<SubtitleId>(),
+          startFrame: f.startFrame,
+          endFrame: f.endFrame,
+          text: f.text,
+        }))]);
+        setTranscribeMsg(`Added ${segments.length} caption${segments.length === 1 ? "" : "s"}.`);
+      }
+    } catch (err) {
+      if ((err as DOMException).name === "AbortError") setTranscribeMsg("Cancelled.");
+      else setTranscribeMsg(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setTranscribing(false);
+      transcribeAbort.current = null;
+    }
+  };
+
   return (
     <Modal title="SUBTITLES" icon={<Captions size={14} className="text-accent" />} onClose={onClose} wide>
-      <div className="mb-3 flex flex-wrap gap-2">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
         <button
           onClick={() => addSubtitle(transport.getFrame(), transport.getFrame() + fps * 2, "New caption")}
           className="rounded border border-edge bg-panel-raised px-2 py-1 text-[11px] text-neutral-200 hover:border-accent/60"
@@ -2567,7 +2613,34 @@ const SubtitlesPanel = ({ onClose }: { onClose: () => void }) => {
         <button onClick={exportSrt} className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
           Export .srt
         </button>
+        {!transcribing ? (
+          <button
+            onClick={runTranscribe}
+            className="rounded bg-accent/90 px-2 py-1 text-[11px] font-medium text-white hover:bg-accent"
+            title="Run Whisper (whisper-tiny.en) locally in your browser. First run downloads ~40MB of model weights."
+          >
+            ⚡ Auto-transcribe
+          </button>
+        ) : (
+          <button
+            onClick={() => transcribeAbort.current?.abort()}
+            className="rounded border border-red-500/50 px-2 py-1 text-[11px] text-red-300 hover:bg-red-500/10"
+          >
+            Cancel transcription
+          </button>
+        )}
+        {(transcribing || transcribeMsg) && (
+          <span className="text-[10px] text-neutral-400">
+            {transcribeMsg}
+            {transcribing && ` · ${transcribePct}%`}
+          </span>
+        )}
       </div>
+      {transcribing && (
+        <div className="mb-3 h-1 w-full overflow-hidden rounded bg-panel-raised">
+          <div className="h-full bg-accent transition-[width]" style={{ width: `${transcribePct}%` }} />
+        </div>
+      )}
 
       <div className="mb-3 grid grid-cols-4 gap-2 rounded border border-edge bg-panel/40 p-2 text-[10px]">
         <NumberField label="Size" value={style.fontSizePx} onChange={(v) => setStyle({ fontSizePx: Math.max(8, v) })} />
