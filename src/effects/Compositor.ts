@@ -239,12 +239,32 @@ export class WebGPUCompositor {
       layer.height = height;
     }
 
-    this.device.queue.copyExternalImageToTexture(
-      { source: frame },
-      { texture: layer.texture },
-      { width, height },
-    );
-    layer.hasFrame = true;
+    // copyExternalImageToTexture is reliable for ImageBitmap / VideoFrame but
+    // NOT for a raw HTMLVideoElement across Chromium versions — that path is
+    // what left video blank while images/overlays (ImageBitmap) rendered fine.
+    // Wrap a video element in a VideoFrame (synchronous, always accepted here).
+    let source: VideoFrame | HTMLVideoElement | ImageBitmap = frame;
+    let wrapped: VideoFrame | null = null;
+    if (frame instanceof HTMLVideoElement && typeof VideoFrame !== "undefined") {
+      try {
+        wrapped = new VideoFrame(frame, { timestamp: 0 });
+        source = wrapped;
+      } catch {
+        source = frame; // fall back to the raw element
+      }
+    }
+    try {
+      this.device.queue.copyExternalImageToTexture(
+        { source },
+        { texture: layer.texture },
+        { width, height },
+      );
+      layer.hasFrame = true;
+    } catch (error) {
+      console.error("[WebCut] frame upload failed:", error);
+    } finally {
+      wrapped?.close();
+    }
   }
 
   /** Forward an ONNX inference result into the matte binding slot. */
