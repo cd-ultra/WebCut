@@ -19,7 +19,7 @@
  */
 
 import { fileSystemService } from "./FileSystemService";
-import { drawAudioVizItem, drawShapeItem, drawStickerItem, drawSubtitle, drawTextItem, getWaveformPeaks } from "./PreviewService";
+import { drawAudioVizItem, drawParticleItem, drawShapeItem, drawStickerItem, drawSubtitle, drawTextItem, getWaveformPeaks } from "./PreviewService";
 import { isOverlayItem, sampleAnimatable, type MediaAsset, type Project } from "../types/timeline";
 
 const hexToRgb = (hex: string): [number, number, number] => {
@@ -82,6 +82,7 @@ export const rasterizeNestedFrame = async (project: Project, nestedFrame: number
         if (item.type === "text") drawTextItem(ctx as unknown as CanvasRenderingContext2D, item);
         else if (item.type === "shape") drawShapeItem(ctx as unknown as CanvasRenderingContext2D, item, w, h);
         else if (item.type === "sticker") drawStickerItem(ctx as unknown as CanvasRenderingContext2D, item);
+        else if (item.type === "particles") drawParticleItem(ctx as unknown as CanvasRenderingContext2D, item, w, h, local, project.settings.frameRate);
         else {
           const asset = project.assets.find((a) => a.id === item.assetId);
           const peaks = asset ? await getWaveformPeaks(asset) : null;

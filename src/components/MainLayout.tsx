@@ -61,6 +61,7 @@ import {
   identityGrade,
   identityTransform,
   makeAudioVizItem,
+  makeParticleItem,
   makeShapeItem,
   makeStickerItem,
   makeTextItem,
@@ -91,6 +92,7 @@ import {
   type AnimatableValue,
   type AudioVizItem,
   type MaskKeyframe,
+  type ParticleItem,
   type MaskShape,
   type ShapeItem,
   type ShapeMask,
@@ -105,6 +107,7 @@ import {
 } from "../types/timeline";
 import type { TransformProp } from "../store/timelineStore";
 import { chordFromEvent, COMMANDS, prettyChord, resetBindings, setBinding, useKeymap, type CommandId } from "../store/keymap";
+import { validateExpression } from "../expression";
 import { evalCurve, parseCubeLut, registerLut } from "../effects/lut";
 import { projectEndFrame, type ExportFormat } from "../services/ExportService";
 import { segmentsToSubtitleFrames, transcribeProject } from "../services/transcription";
@@ -438,6 +441,7 @@ const MediaPool = () => {
             onClick={() => insertOverlay((s, d) => makeShapeItem("ellipse", s, d))}
           />
           <InsertButton icon={<Activity size={12} />} label="Audio viz" onClick={insertAudioViz} />
+          <InsertButton icon={<Sparkles size={12} />} label="Particles" onClick={() => insertOverlay(makeParticleItem)} />
         </div>
         <details className="mt-2">
           <summary className="cursor-pointer list-none text-[10px] text-neutral-400 hover:text-neutral-200">
@@ -631,7 +635,7 @@ const TransformSection = ({ item, updateItem }: { item: TrackItem; updateItem: U
   // Upsert a keyframe at the playhead when animated; otherwise set the static value.
   const setVec = (prop: "position" | "scale", next: Vec2) => {
     const av = item.transform[prop];
-    if (av.kind === "static") return setTransform({ [prop]: staticValue(next) } as Partial<Transform>);
+    if (av.kind !== "animated") return setTransform({ [prop]: staticValue(next) } as Partial<Transform>);
     const keyframes = [
       ...av.keyframes.filter((k) => k.frame !== local),
       { id: createId<KeyframeId>(), frame: local, value: next, interpolation: "linear" as const },
@@ -640,7 +644,7 @@ const TransformSection = ({ item, updateItem }: { item: TrackItem; updateItem: U
   };
   const setNum = (prop: "rotation" | "opacity", next: number) => {
     const av = item.transform[prop];
-    if (av.kind === "static") return setTransform({ [prop]: staticValue(next) } as Partial<Transform>);
+    if (av.kind !== "animated") return setTransform({ [prop]: staticValue(next) } as Partial<Transform>);
     const keyframes = [
       ...av.keyframes.filter((k) => k.frame !== local),
       { id: createId<KeyframeId>(), frame: local, value: next, interpolation: "linear" as const },
@@ -684,8 +688,51 @@ const TransformSection = ({ item, updateItem }: { item: TrackItem; updateItem: U
         </div>
         <KeyToggle animated={animated("opacity")} onClick={() => toggle("opacity")} />
       </div>
+      <ExpressionRows item={item} />
       <KeyframeGraph item={item} updateItem={updateItem} />
     </Section>
+  );
+};
+
+// Scripting (#63): expression editors for the scalar transform props.
+const ExpressionRows = ({ item }: { item: TrackItem }) => {
+  const setTransformExpression = useTimelineStore((s) => s.setTransformExpression);
+  const [open, setOpen] = useState(false);
+  const row = (prop: "rotation" | "opacity", label: string) => {
+    const av = item.transform[prop];
+    const expr = av.kind === "expression" ? av.expr : "";
+    const active = av.kind === "expression";
+    return (
+      <div className="mb-1">
+        <div className="mb-0.5 flex items-center justify-between">
+          <span className="text-[9px] uppercase tracking-wide text-neutral-500">{label} fx</span>
+          {active && (
+            <button onClick={() => setTransformExpression(item.id, prop, null)} className="rounded border border-edge px-1 py-0.5 text-[9px] text-neutral-500 hover:border-red-500/60">
+              Clear
+            </button>
+          )}
+        </div>
+        <input
+          value={expr}
+          placeholder={prop === "rotation" ? "e.g. wiggle(2, 15)" : "e.g. 0.5 + 0.5*sin(time*3)"}
+          onChange={(e) => setTransformExpression(item.id, prop, e.target.value || null)}
+          className={`w-full rounded border bg-panel-raised px-1.5 py-1 font-mono text-[10px] outline-none ${validateExpression(expr) && expr ? "border-red-500/60 text-red-300" : "border-edge text-neutral-200"}`}
+        />
+      </div>
+    );
+  };
+  return (
+    <details open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)} className="mt-2 border-t border-edge/50 pt-1.5">
+      <summary className="cursor-pointer text-[9px] uppercase tracking-wide text-neutral-500">Expressions (rotation / opacity)</summary>
+      <div className="pt-1">
+        {row("rotation", "Rotation")}
+        {row("opacity", "Opacity")}
+        <p className="text-[9px] leading-tight text-neutral-600">
+          Variables: time, frame, fps, value. Functions: sin cos tan abs floor ceil round sqrt pow min
+          max clamp mod wiggle(freq,amp) random. Errors fall back to the base value.
+        </p>
+      </div>
+    </details>
   );
 };
 
@@ -964,6 +1011,37 @@ const AudioVizSection = ({ item, updateItem }: { item: TrackItem; updateItem: Up
   );
 };
 
+const ParticleSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
+  if (item.type !== "particles") return null;
+  const set = (patch: Partial<ParticleItem>) =>
+    updateItem(item.id, (it) => (it.type === "particles" ? { ...it, ...patch } : it), "particles");
+  return (
+    <Section title="Particles">
+      <div className="mb-1 flex items-center justify-between">
+        <ColorInput label="Color" value={item.color} onChange={(v) => set({ color: v })} />
+        <button
+          onClick={() => set({ seed: Math.floor(Math.random() * 1e6) })}
+          className="rounded border border-edge px-1.5 py-0.5 text-[9px] text-neutral-400 hover:border-accent/60"
+          title="Re-seed the emitter"
+        >
+          Reseed
+        </button>
+      </div>
+      <SliderRow label="Rate /s" value={item.rate} min={1} max={300} step={1} onChange={(v) => set({ rate: Math.round(v) })} />
+      <SliderRow label="Lifetime s" value={item.lifetime} min={0.1} max={6} step={0.1} onChange={(v) => set({ lifetime: v })} />
+      <SliderRow label="Speed px/s" value={item.speed} min={0} max={800} step={5} onChange={(v) => set({ speed: v })} />
+      <SliderRow label="Direction°" value={item.direction} min={-180} max={180} step={1} onChange={(v) => set({ direction: v })} />
+      <SliderRow label="Spread°" value={item.spread} min={0} max={360} step={1} onChange={(v) => set({ spread: v })} />
+      <SliderRow label="Gravity" value={item.gravity} min={-600} max={1200} step={10} onChange={(v) => set({ gravity: v })} />
+      <SliderRow label="Size px" value={item.size} min={1} max={40} step={0.5} onChange={(v) => set({ size: v })} />
+      <div className="mt-1 grid grid-cols-2 gap-2">
+        <NumberField label="Origin X" value={round2(item.originX)} step={0.02} onChange={(v) => set({ originX: Math.max(0, Math.min(1, v)) })} />
+        <NumberField label="Origin Y" value={round2(item.originY)} step={0.02} onChange={(v) => set({ originY: Math.max(0, Math.min(1, v)) })} />
+      </div>
+    </Section>
+  );
+};
+
 const ClipSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
   if (item.type !== "clip") return null;
   const setSpeed = (speed: number) =>
@@ -1064,7 +1142,8 @@ const EffectsSection = ({ item }: { item: TrackItem }) => {
     updateItemEffects(item.id, next);
   };
 
-  const numOf = (av: AnimatableValue<number>): number => (av.kind === "static" ? av.value : av.keyframes[0]?.value ?? 0);
+  const numOf = (av: AnimatableValue<number>): number =>
+    av.kind === "static" ? av.value : av.kind === "expression" ? av.base : av.keyframes[0]?.value ?? 0;
   const setNumParam = (idx: number, key: string, value: number) => {
     patchEffect(idx, (e) => {
       const eAny = e as unknown as { params: Record<string, AnimatableValue<number>> };
@@ -2136,6 +2215,7 @@ const Inspector = () => {
             <TextSection item={selectedItem} updateItem={updateItem} />
             <ShapeSection item={selectedItem} updateItem={updateItem} />
             <AudioVizSection item={selectedItem} updateItem={updateItem} />
+            <ParticleSection item={selectedItem} updateItem={updateItem} />
             <ClipSection item={selectedItem} updateItem={updateItem} />
             <EffectsSection item={selectedItem} />
             <MaskSection item={selectedItem} />

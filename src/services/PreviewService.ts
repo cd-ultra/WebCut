@@ -16,6 +16,7 @@
 import { fileSystemService } from "./FileSystemService";
 import { getUseProxies } from "./ProxyService";
 import { getWaveform } from "./waveform";
+import { getExpressionFps, setExpressionFps } from "../expression";
 import { transport, useTimelineStore } from "../store/timelineStore";
 import {
   defaultCorridorKeyParams,
@@ -34,6 +35,7 @@ import {
   type MediaAssetId,
   type AudioVizItem,
   type OverlayItem,
+  type ParticleItem,
   type Project,
   type ProjectSettings,
   type ShapeItem,
@@ -289,6 +291,7 @@ class PreviewService {
     const { project } = useTimelineStore.getState();
     const frame = transport.getFrame();
     const fps = project.settings.frameRate;
+    setExpressionFps(fps); // #63: expressions read time = frame / fps
     const actives = resolveActiveClips(project, frame);
     const overlays = resolveActiveOverlays(project, frame);
 
@@ -550,9 +553,10 @@ class PreviewService {
       rotation: sampleAnimatable(item.transform.rotation, local),
       opacity: sampleAnimatable(item.transform.opacity, local),
     };
-    // Audio visualizer re-rasterizes per frame (it scrolls with playback), so
-    // its signature carries the local frame; static overlays cache normally.
-    const sig = item.type === "audioviz"
+    // Audio visualizer + particles re-rasterize per frame (they animate with
+    // playback), so their signature carries the local frame; static overlays
+    // cache normally.
+    const sig = item.type === "audioviz" || item.type === "particles"
       ? `${overlaySignature(item, settings, t)}|f${local}`
       : overlaySignature(item, settings, t);
     const cached = this.overlayCache.get(item.id);
@@ -602,7 +606,8 @@ class PreviewService {
     if (item.type === "text") drawTextItem(ctx, item);
     else if (item.type === "shape") drawShapeItem(ctx, item, w, h);
     else if (item.type === "sticker") drawStickerItem(ctx, item);
-    else drawAudioVizItem(ctx, item, peaks, localFrame, item.durationFrames);
+    else if (item.type === "audioviz") drawAudioVizItem(ctx, item, peaks, localFrame, item.durationFrames);
+    else drawParticleItem(ctx, item, w, h, localFrame, getExpressionFps());
     ctx.restore();
     // Premultiply so the compositor's premultiplied "over" blend is correct.
     return createImageBitmap(canvas, { premultiplyAlpha: "premultiply" });
@@ -719,7 +724,17 @@ export const drawAudioVizItem = (
     ctx.stroke();
     return;
   }
+  drawAudioVizBars(ctx, item, sampleAt, W, H, n);
+};
 
+const drawAudioVizBars = (
+  ctx: CanvasRenderingContext2D,
+  item: AudioVizItem,
+  sampleAt: (i: number) => number,
+  W: number,
+  H: number,
+  n: number,
+): void => {
   const barW = (W / n) * 0.7;
   for (let i = 0; i < n; i++) {
     const v = sampleAt(i);
@@ -734,6 +749,61 @@ export const drawAudioVizItem = (
   }
 };
 
+// Deterministic hash → [0,1) for the particle emitter.
+const particleHash = (n: number): number => {
+  const s = Math.sin(n * 12.9898 + 78.233) * 43758.5453;
+  return s - Math.floor(s);
+};
+
+/**
+ * Draw a particle emitter (#64) deterministically for the given frame. No
+ * simulation history is kept — each particle's state is a closed-form function
+ * of its (seeded) birth parameters and age, so preview and export match and any
+ * frame can be rendered in isolation. Drawn in the item's transformed space
+ * (origin at the item center).
+ */
+export const drawParticleItem = (
+  ctx: CanvasRenderingContext2D,
+  item: ParticleItem,
+  w: number,
+  h: number,
+  localFrame: number,
+  fps: number,
+): void => {
+  const t = localFrame / (fps || 30);
+  const emitterX = (item.originX - 0.5) * w;
+  const emitterY = (item.originY - 0.5) * h;
+  const rate = Math.max(1, item.rate);
+  const lifetime = Math.max(0.05, item.lifetime);
+  const iMax = Math.floor(t * rate);
+  const iMin = Math.max(0, Math.ceil((t - lifetime) * rate));
+  const baseAlpha = ctx.globalAlpha;
+  ctx.fillStyle = item.color;
+
+  for (let i = iMin; i <= iMax; i++) {
+    const birth = i / rate;
+    const age = t - birth;
+    if (age < 0 || age > lifetime) continue;
+    const r1 = particleHash(item.seed + i * 1.13);
+    const r2 = particleHash(item.seed + i * 2.71 + 0.5);
+    const angleDeg = item.direction + (r1 - 0.5) * item.spread;
+    const angle = (angleDeg * Math.PI) / 180;
+    const speed = item.speed * (0.7 + 0.6 * r2);
+    // direction 0 = up (negative y).
+    const vx = Math.sin(angle) * speed;
+    const vy = -Math.cos(angle) * speed;
+    const x = emitterX + vx * age;
+    const y = emitterY + vy * age + 0.5 * item.gravity * age * age;
+    const lifeT = age / lifetime;
+    const radius = Math.max(0.5, item.size * (1 - 0.4 * lifeT));
+    ctx.globalAlpha = baseAlpha * Math.max(0, 1 - lifeT);
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = baseAlpha;
+};
+
 const overlaySignature = (item: OverlayItem, settings: ProjectSettings, t: SampledTransform): string => {
   const base = `${settings.width}x${settings.height}|${t.pos.x},${t.pos.y}|${t.scale.x},${t.scale.y}|${t.rotation}|${t.opacity}`;
   if (item.type === "text") {
@@ -744,6 +814,9 @@ const overlaySignature = (item: OverlayItem, settings: ProjectSettings, t: Sampl
   }
   if (item.type === "audioviz") {
     return `audioviz|${base}|${item.assetId}|${item.style}|${item.color}|${item.barCount}`;
+  }
+  if (item.type === "particles") {
+    return `particles|${base}|${item.originX},${item.originY}|${item.rate}|${item.lifetime}|${item.speed}|${item.direction}|${item.spread}|${item.gravity}|${item.size}|${item.color}|${item.seed}`;
   }
   return `shape|${base}|${item.shape}|${item.fillColor}|${item.strokeColor}|${item.strokeWidthPx}|${item.cornerRadiusPx}|${JSON.stringify(item.fillGradient ?? null)}`;
 };
