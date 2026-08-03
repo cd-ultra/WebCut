@@ -60,6 +60,7 @@ import {
   GRADIENT_PRESETS,
   identityGrade,
   identityTransform,
+  makeAudioVizItem,
   makeShapeItem,
   makeStickerItem,
   makeTextItem,
@@ -88,6 +89,7 @@ import {
   type MediaAssetId,
   type MediaKind,
   type AnimatableValue,
+  type AudioVizItem,
   type MaskKeyframe,
   type MaskShape,
   type ShapeItem,
@@ -328,6 +330,26 @@ const MediaPool = () => {
     [tracks, frameRate, addItemToTrack],
   );
 
+  const insertAudioViz = useCallback(() => {
+    const state = useTimelineStore.getState();
+    // Prefer the selected clip's asset, else the first audio, else first video.
+    let assetId: MediaAssetId | undefined;
+    const selId = state.selectedItemIds[0];
+    for (const track of state.project.tracks) {
+      for (const item of track.items) {
+        if (item.id === selId && item.type === "clip") assetId = item.assetId;
+      }
+    }
+    if (!assetId) assetId = state.project.assets.find((a) => a.kind === "audio")?.id;
+    if (!assetId) assetId = state.project.assets.find((a) => a.kind === "video")?.id;
+    if (!assetId) {
+      setError("Import or select an audio/video clip first — the visualizer needs a source.");
+      return;
+    }
+    const aid = assetId;
+    insertOverlay((s, d) => makeAudioVizItem(aid, s, d));
+  }, [insertOverlay]);
+
   const handleImport = useCallback(async () => {
     setImporting(true);
     setError(null);
@@ -415,6 +437,7 @@ const MediaPool = () => {
             label="Ellipse"
             onClick={() => insertOverlay((s, d) => makeShapeItem("ellipse", s, d))}
           />
+          <InsertButton icon={<Activity size={12} />} label="Audio viz" onClick={insertAudioViz} />
         </div>
         <details className="mt-2">
           <summary className="cursor-pointer list-none text-[10px] text-neutral-400 hover:text-neutral-200">
@@ -902,6 +925,45 @@ const ShapeSection = ({ item, updateItem }: { item: TrackItem; updateItem: Updat
   );
 };
 
+const AudioVizSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
+  const assets = useTimelineStore((s) => s.project.assets);
+  if (item.type !== "audioviz") return null;
+  const set = (patch: Partial<AudioVizItem>) =>
+    updateItem(item.id, (it) => (it.type === "audioviz" ? { ...it, ...patch } : it), "audioviz");
+  const audioAssets = assets.filter((a) => a.kind === "audio" || a.kind === "video");
+  return (
+    <Section title="Audio visualizer">
+      <label className="mb-1.5 block">
+        <span className="mb-0.5 block text-[10px] text-neutral-400">Source</span>
+        <select
+          value={item.assetId}
+          onChange={(e) => set({ assetId: e.target.value as unknown as AudioVizItem["assetId"] })}
+          className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200"
+        >
+          {audioAssets.map((a) => (
+            <option key={a.id} value={a.id}>{a.name}</option>
+          ))}
+        </select>
+      </label>
+      <div className="mb-1.5 flex gap-1">
+        {(["bars", "mirror", "wave"] as const).map((s) => (
+          <button
+            key={s}
+            onClick={() => set({ style: s })}
+            className={`flex-1 rounded px-1.5 py-0.5 text-[10px] capitalize ${item.style === s ? "bg-accent/30 text-accent" : "border border-edge text-neutral-400 hover:border-accent/60"}`}
+          >
+            {s}
+          </button>
+        ))}
+      </div>
+      <div className="flex items-center justify-between">
+        <ColorInput label="Color" value={item.color} onChange={(v) => set({ color: v })} />
+        <NumberField label="Bars" value={item.barCount} onChange={(v) => set({ barCount: Math.max(4, Math.min(256, Math.round(v))) })} />
+      </div>
+    </Section>
+  );
+};
+
 const ClipSection = ({ item, updateItem }: { item: TrackItem; updateItem: UpdateItemFn }) => {
   if (item.type !== "clip") return null;
   const setSpeed = (speed: number) =>
@@ -916,7 +978,7 @@ const ClipSection = ({ item, updateItem }: { item: TrackItem; updateItem: Update
       },
       "speed",
     );
-  const setAudio = (patch: Partial<Pick<ClipItem, "audioGainDb" | "audioMuted">>) =>
+  const setAudio = (patch: Partial<Pick<ClipItem, "audioGainDb" | "audioMuted" | "denoiseStrength">>) =>
     updateItem(item.id, (it) => (it.type === "clip" ? { ...it, ...patch } : it), "audio");
   return (
     <Section title="Clip">
@@ -929,6 +991,19 @@ const ClipSection = ({ item, updateItem }: { item: TrackItem; updateItem: Update
         step={0.5}
         onChange={(v) => setAudio({ audioGainDb: v })}
       />
+      <SliderRow
+        label="Denoise"
+        value={item.denoiseStrength ?? 0}
+        min={0}
+        max={1}
+        step={0.05}
+        onChange={(v) => setAudio({ denoiseStrength: v <= 0 ? undefined : v })}
+      />
+      {(item.denoiseStrength ?? 0) > 0 && (
+        <p className="text-[9px] leading-tight text-neutral-600">
+          Spectral noise reduction applies on export (preview is unprocessed).
+        </p>
+      )}
       <label className="flex items-center gap-2 pt-1 text-[10px] text-neutral-400">
         <input
           type="checkbox"
@@ -1526,6 +1601,105 @@ const MulticamSection = ({ item }: { item: TrackItem }) => {
   );
 };
 
+// ---------------------------------------------------------------------------
+// Scene / cut detection (#56): split a clip at silence gaps or shot changes.
+// ---------------------------------------------------------------------------
+
+const SceneDetectSection = ({ item }: { item: TrackItem }) => {
+  const project = useTimelineStore((s) => s.project);
+  const splitItemAtFrame = useTimelineStore((s) => s.splitItemAtFrame);
+  const [mode, setMode] = useState<"silence" | "shots">("silence");
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [message, setMessage] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  if (item.type !== "clip") return null;
+  const clip = item;
+  const asset = project.assets.find((a) => a.id === clip.assetId);
+  if (!asset) return null;
+
+  const run = async () => {
+    setBusy(true);
+    setMessage(null);
+    setProgress(0);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      const { detectSilenceSplits, detectShotSplits } = await import("../services/sceneDetect");
+      let localSplits: number[];
+      if (mode === "silence") {
+        localSplits = await detectSilenceSplits(asset, clip.sourceInFrame, clip.durationFrames, project.settings.frameRate);
+      } else {
+        localSplits = await detectShotSplits(
+          asset,
+          clip.sourceInFrame,
+          clip.durationFrames,
+          project.settings.frameRate,
+          (p) => setProgress(Math.round((p.frame / p.totalFrames) * 100)),
+          controller.signal,
+        );
+      }
+      if (localSplits.length === 0) {
+        setMessage(mode === "silence" ? "No silence gaps found." : "No shot changes found.");
+        return;
+      }
+      // Split from the largest absolute frame down so the original clip's id
+      // (which keeps the left piece) stays valid for each successive cut.
+      const absolute = localSplits.map((f) => clip.startFrame + f).sort((a, b) => b - a);
+      for (const frame of absolute) splitItemAtFrame(clip.id, frame);
+      setMessage(`Split into ${absolute.length + 1} clips.`);
+    } catch (err) {
+      if ((err as DOMException).name === "AbortError") setMessage("Cancelled.");
+      else setMessage(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusy(false);
+      abortRef.current = null;
+    }
+  };
+
+  return (
+    <Section title="Scene detection">
+      <div className="mb-1.5 flex gap-1">
+        {(["silence", "shots"] as const).map((m) => (
+          <button
+            key={m}
+            onClick={() => setMode(m)}
+            className={`flex-1 rounded px-1.5 py-0.5 text-[10px] capitalize ${mode === m ? "bg-accent/30 text-accent" : "border border-edge text-neutral-400 hover:border-accent/60"}`}
+          >
+            {m === "silence" ? "By silence" : "By shot"}
+          </button>
+        ))}
+      </div>
+      <p className="mb-1.5 text-[9px] leading-tight text-neutral-600">
+        {mode === "silence"
+          ? "Splits at audio silences (e.g. between spoken sentences)."
+          : "Splits at hard visual cuts via frame differencing."}
+      </p>
+      {busy && mode === "shots" && (
+        <div className="mb-2">
+          <div className="mb-0.5 flex justify-between text-[10px] text-neutral-500">
+            <span>Analyzing</span>
+            <span className="font-mono">{progress}%</span>
+          </div>
+          <div className="h-1 w-full overflow-hidden rounded bg-panel-raised">
+            <div className="h-full bg-accent transition-[width]" style={{ width: `${progress}%` }} />
+          </div>
+        </div>
+      )}
+      {message && <p className="mb-1.5 text-[10px] text-neutral-500">{message}</p>}
+      {!busy ? (
+        <button onClick={run} className="w-full rounded border border-edge px-2 py-0.5 text-[10px] text-neutral-300 hover:border-accent/60">
+          Detect &amp; split
+        </button>
+      ) : (
+        <button onClick={() => abortRef.current?.abort()} className="w-full rounded border border-red-500/50 px-2 py-0.5 text-[10px] text-red-300 hover:bg-red-500/10">
+          {mode === "shots" ? "Cancel" : "Working…"}
+        </button>
+      )}
+    </Section>
+  );
+};
+
 /** RGB triple of sliders for one lift/gamma/gain wheel channel. */
 const GradeTriple = ({
   label,
@@ -1961,12 +2135,14 @@ const Inspector = () => {
             <TransformSection item={selectedItem} updateItem={updateItem} />
             <TextSection item={selectedItem} updateItem={updateItem} />
             <ShapeSection item={selectedItem} updateItem={updateItem} />
+            <AudioVizSection item={selectedItem} updateItem={updateItem} />
             <ClipSection item={selectedItem} updateItem={updateItem} />
             <EffectsSection item={selectedItem} />
             <MaskSection item={selectedItem} />
             <TransitionSection item={selectedItem} />
             <SpeedSection item={selectedItem} />
             <StabilizeSection item={selectedItem} />
+            <SceneDetectSection item={selectedItem} />
             <MulticamSection item={selectedItem} />
             <ColorSection item={selectedItem} updateItem={updateItem} />
             <BlendSection item={selectedItem} updateItem={updateItem} />

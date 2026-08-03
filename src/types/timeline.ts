@@ -496,6 +496,12 @@ export interface ClipItem extends TrackItemBase {
    * When present it is summed with `audioGainDb`. Absent ⇒ flat gain.
    */
   readonly gainRamp?: AnimatableValue<number>;
+  /**
+   * Noise-reduction strength 0..1 (#58). Applied via spectral subtraction in
+   * the export mixdown. 0 / absent ⇒ no processing. Preview is unaffected
+   * (there's no live audio-processing graph yet).
+   */
+  readonly denoiseStrength?: number;
   readonly audioMuted: boolean;
   /** Primary color grade; absent ⇒ identity (no correction). */
   readonly grade?: ColorGrade;
@@ -542,12 +548,42 @@ export interface StickerItem extends TrackItemBase {
   readonly content: string;
 }
 
-export type TrackItem = ClipItem | ShapeItem | TextItem | StickerItem;
-export type OverlayItem = TextItem | ShapeItem | StickerItem;
+/** Audio waveform / spectrum visualizer overlay (#65). */
+export interface AudioVizItem extends TrackItemBase {
+  readonly type: "audioviz";
+  /** The audio (or video-with-audio) asset whose waveform drives the visual. */
+  readonly assetId: MediaAssetId;
+  readonly style: "bars" | "wave" | "mirror";
+  readonly color: string;
+  /** Number of bars/samples drawn across the width. */
+  readonly barCount: number;
+}
+
+export type TrackItem = ClipItem | ShapeItem | TextItem | StickerItem | AudioVizItem;
+export type OverlayItem = TextItem | ShapeItem | StickerItem | AudioVizItem;
 
 /** True for items composited as overlays (rendered from vector/text, not media). */
 export const isOverlayItem = (item: TrackItem): item is OverlayItem =>
-  item.type === "text" || item.type === "shape" || item.type === "sticker";
+  item.type === "text" || item.type === "shape" || item.type === "sticker" || item.type === "audioviz";
+
+/** Factory: an audio waveform visualizer overlay. */
+export const makeAudioVizItem = (
+  assetId: MediaAssetId,
+  startFrame: number,
+  durationFrames: number,
+): Omit<AudioVizItem, "id"> => ({
+  type: "audioviz",
+  name: "Audio viz",
+  startFrame,
+  durationFrames,
+  transform: identityTransform(),
+  effects: [],
+  locked: false,
+  assetId,
+  style: "bars",
+  color: "#4f8cff",
+  barCount: 48,
+});
 
 /** Factory: a text overlay with sensible defaults, ready for `addItemToTrack`. */
 export const makeTextItem = (startFrame: number, durationFrames: number): Omit<TextItem, "id"> => ({

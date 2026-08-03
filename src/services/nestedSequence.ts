@@ -19,7 +19,7 @@
  */
 
 import { fileSystemService } from "./FileSystemService";
-import { drawShapeItem, drawStickerItem, drawSubtitle, drawTextItem } from "./PreviewService";
+import { drawAudioVizItem, drawShapeItem, drawStickerItem, drawSubtitle, drawTextItem, getWaveformPeaks } from "./PreviewService";
 import { isOverlayItem, sampleAnimatable, type MediaAsset, type Project } from "../types/timeline";
 
 const hexToRgb = (hex: string): [number, number, number] => {
@@ -81,7 +81,12 @@ export const rasterizeNestedFrame = async (project: Project, nestedFrame: number
         ctx.scale(scale.x, scale.y);
         if (item.type === "text") drawTextItem(ctx as unknown as CanvasRenderingContext2D, item);
         else if (item.type === "shape") drawShapeItem(ctx as unknown as CanvasRenderingContext2D, item, w, h);
-        else drawStickerItem(ctx as unknown as CanvasRenderingContext2D, item);
+        else if (item.type === "sticker") drawStickerItem(ctx as unknown as CanvasRenderingContext2D, item);
+        else {
+          const asset = project.assets.find((a) => a.id === item.assetId);
+          const peaks = asset ? await getWaveformPeaks(asset) : null;
+          drawAudioVizItem(ctx as unknown as CanvasRenderingContext2D, item, peaks, local, item.durationFrames);
+        }
         ctx.restore();
       }
     }
