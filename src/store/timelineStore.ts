@@ -214,6 +214,12 @@ export interface TimelineState {
   removeItems(itemIds: readonly TrackItemId[]): void;
   rippleDelete(itemIds: readonly TrackItemId[]): void;
   setSelection(itemIds: readonly TrackItemId[]): void;
+  /** Split a video clip's audio onto an audio track, linked to the original (#99). */
+  detachAudioFromClip(itemId: TrackItemId): TrackItemId | null;
+  /** Put the given items in one link group so they move/trim/split together. */
+  linkItems(itemIds: readonly TrackItemId[]): void;
+  /** Break the link group(s) the given items belong to. */
+  unlinkItems(itemIds: readonly TrackItemId[]): void;
   updateItemEffects(itemId: TrackItemId, effects: readonly Effect[]): void;
   updateItem(itemId: TrackItemId, updater: (item: TrackItem) => TrackItem, coalesceKey?: string): void;
   setProjectSettings(patch: Partial<ProjectSettings>): void;
@@ -290,6 +296,60 @@ const mapItems = (project: Project, fn: (item: TrackItem, track: Track) => Track
     items: track.items.map((item) => fn(item, track)),
   })),
 });
+
+// -- Linked A/V helpers (#99) ------------------------------------------------
+
+/** Every item in the project, flattened. */
+const allItems = (project: Project): TrackItem[] => project.tracks.flatMap((track) => [...track.items]);
+
+/**
+ * Expand a set of item ids to include every link-group partner.
+ *
+ * Used by move/trim/split and by selection so a detached A/V pair behaves as
+ * one object. Items with no `linkGroupId` expand to themselves.
+ */
+export const expandLinked = (project: Project, itemIds: readonly TrackItemId[]): Set<TrackItemId> => {
+  const ids = new Set<TrackItemId>(itemIds);
+  const items = allItems(project);
+  const groups = new Set(
+    items.filter((item) => ids.has(item.id) && item.linkGroupId).map((item) => item.linkGroupId as string),
+  );
+  if (groups.size === 0) return ids;
+  for (const item of items) {
+    if (item.linkGroupId && groups.has(item.linkGroupId)) ids.add(item.id);
+  }
+  return ids;
+};
+
+/**
+ * Fresh link-group ids for a batch of items about to be cloned (duplicate or
+ * paste).
+ *
+ * Copies must never join the *original's* group — moving the copy would drag
+ * the original around. A group is preserved (under a new id) only when the
+ * batch contains at least two of its members, i.e. the pair was copied as a
+ * pair; a lone half comes out unlinked.
+ */
+const remapLinkGroups = (items: readonly TrackItem[]): Map<string, string> => {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    if (item.linkGroupId) counts.set(item.linkGroupId, (counts.get(item.linkGroupId) ?? 0) + 1);
+  }
+  const remap = new Map<string, string>();
+  for (const [groupId, count] of counts) {
+    if (count > 1) remap.set(groupId, createId<string>());
+  }
+  return remap;
+};
+
+/** Apply `remapLinkGroups` output to one cloned item. */
+const withRemappedLink = (item: TrackItem, remap: ReadonlyMap<string, string>): TrackItem => {
+  if (!item.linkGroupId) return item;
+  const next = remap.get(item.linkGroupId);
+  if (next) return { ...item, linkGroupId: next };
+  const { linkGroupId: _dropped, ...rest } = item;
+  return rest as TrackItem;
+};
 
 // -- Keyframe helpers --------------------------------------------------------
 // Transform values are Vec2 (position/scale) or number (rotation/opacity). The
@@ -490,11 +550,23 @@ export const useTimelineStore = create<TimelineState>()(
     moveItem: (itemId, deltaFrames, targetTrackId) =>
       set((state) => {
         let moved: TrackItem | undefined;
+        // Linked partners (#99) shift by the same delta but stay on their own
+        // tracks — only the item actually dragged may change track.
+        const partners = expandLinked(state.project, [itemId]);
+        partners.delete(itemId);
         const stripped = state.project.tracks.map((track) => {
           const found = track.items.find((item) => item.id === itemId);
-          if (!found) return track;
-          moved = { ...found, startFrame: Math.max(0, found.startFrame + deltaFrames) };
-          return { ...track, items: track.items.filter((item) => item.id !== itemId) };
+          if (found) moved = { ...found, startFrame: Math.max(0, found.startFrame + deltaFrames) };
+          return {
+            ...track,
+            items: track.items
+              .filter((item) => item.id !== itemId)
+              .map((item) =>
+                partners.has(item.id)
+                  ? { ...item, startFrame: Math.max(0, item.startFrame + deltaFrames) }
+                  : item,
+              ),
+          };
         });
         if (!moved) return state;
         const destinationId =
@@ -513,9 +585,13 @@ export const useTimelineStore = create<TimelineState>()(
       }),
 
     trimItem: (itemId, edge, newFrame) =>
-      set((state) => ({
+      set((state) => {
+        // A linked pair shares timing, so applying the same absolute edge frame
+        // to every partner keeps them aligned (#99).
+        const targets = expandLinked(state.project, [itemId]);
+        return {
         project: mapItems(state.project, (item) => {
-          if (item.id !== itemId) return item;
+          if (!targets.has(item.id)) return item;
           if (edge === "start") {
             const maxStart = item.startFrame + item.durationFrames - 1;
             const clampedStart = Math.max(0, Math.min(newFrame, maxStart));
@@ -535,38 +611,48 @@ export const useTimelineStore = create<TimelineState>()(
         }),
         revision: state.revision + 1,
         ...pushPastCoalesced(state, "trim"),
-      })),
+        };
+      }),
 
     splitItemAtFrame: (itemId, frame) =>
       set((state) => {
         const wholeFrame = Math.round(frame);
+        // The razor cuts a linked pair on both tracks at once (#99). The left
+        // halves keep the original group; the right halves get a fresh one, so
+        // the two resulting pairs can be moved independently of each other.
+        const targets = expandLinked(state.project, [itemId]);
+        const rightGroupId = createId<string>();
         return {
           project: {
             ...state.project,
             tracks: state.project.tracks.map((track) => {
-              const target = track.items.find((item) => item.id === itemId);
-              if (
-                !target ||
-                wholeFrame <= target.startFrame ||
-                wholeFrame >= target.startFrame + target.durationFrames
-              ) {
-                return track;
-              }
-              const leftDuration = wholeFrame - target.startFrame;
-              const left: TrackItem = { ...target, durationFrames: leftDuration };
-              const rightBase: TrackItem = {
-                ...target,
-                id: createId<TrackItemId>(),
-                startFrame: wholeFrame,
-                durationFrames: target.durationFrames - leftDuration,
-              };
-              const right: TrackItem =
-                rightBase.type === "clip"
-                  ? { ...rightBase, sourceInFrame: rightBase.sourceInFrame + leftDuration * rightBase.speed }
-                  : rightBase;
+              const splittable = track.items.filter(
+                (item) =>
+                  targets.has(item.id) &&
+                  wholeFrame > item.startFrame &&
+                  wholeFrame < item.startFrame + item.durationFrames,
+              );
+              if (splittable.length === 0) return track;
+              const splitIds = new Set(splittable.map((item) => item.id));
               return {
                 ...track,
-                items: track.items.flatMap((item) => (item.id === itemId ? [left, right] : [item])),
+                items: track.items.flatMap((target) => {
+                  if (!splitIds.has(target.id)) return [target];
+                  const leftDuration = wholeFrame - target.startFrame;
+                  const left: TrackItem = { ...target, durationFrames: leftDuration };
+                  const rightBase: TrackItem = {
+                    ...target,
+                    id: createId<TrackItemId>(),
+                    startFrame: wholeFrame,
+                    durationFrames: target.durationFrames - leftDuration,
+                    ...(target.linkGroupId ? { linkGroupId: rightGroupId } : {}),
+                  };
+                  const right: TrackItem =
+                    rightBase.type === "clip"
+                      ? { ...rightBase, sourceInFrame: rightBase.sourceInFrame + leftDuration * rightBase.speed }
+                      : rightBase;
+                  return [left, right];
+                }),
               };
             }),
           },
@@ -618,6 +704,106 @@ export const useTimelineStore = create<TimelineState>()(
       }),
 
     setSelection: (selectedItemIds) => set({ selectedItemIds }),
+
+    /**
+     * Detach a video clip's audio onto an audio track (#99).
+     *
+     * The new clip mirrors the source's timing and audio parameters and points
+     * at the same asset — an <audio> element decodes just the audio track of a
+     * video file, so no re-encode is involved. The source clip is muted so the
+     * sound comes from exactly one place, and the two are linked so they stay
+     * in sync while editing.
+     */
+    detachAudioFromClip: (itemId) => {
+      const state = get();
+      let source: ClipItem | undefined;
+      let sourceTrack: Track | undefined;
+      for (const track of state.project.tracks) {
+        const found = track.items.find((item) => item.id === itemId);
+        if (found && found.type === "clip") {
+          source = found;
+          sourceTrack = track;
+          break;
+        }
+      }
+      if (!source || !sourceTrack) return null;
+      const asset = state.project.assets.find((candidate) => candidate.id === source.assetId);
+      // Only video carries a separable audio track; audio clips are already detached.
+      if (!asset || asset.kind !== "video") return null;
+
+      // Reuse an existing unlocked audio track when there is one, else make one.
+      let destination = state.project.tracks.find((track) => track.kind === "audio" && !track.locked);
+      if (!destination) {
+        const newTrackId = get().addTrack("audio");
+        destination = get().project.tracks.find((track) => track.id === newTrackId);
+      }
+      if (!destination) return null;
+
+      const linkGroupId = createId<string>();
+      const audioId = createId<TrackItemId>();
+      const detached: ClipItem = {
+        ...source,
+        id: audioId,
+        name: `${source.name} (audio)`,
+        linkGroupId,
+        audioMuted: false,
+        // The audio copy has no picture of its own: drop the visual state so it
+        // can't carry stale keys/masks/grades that would never be rendered.
+        effects: [],
+        grade: undefined,
+        mask: undefined,
+        multicam: undefined,
+        transitionIn: undefined,
+        transitionOut: undefined,
+      };
+
+      set((current) => ({
+        project: {
+          ...current.project,
+          tracks: current.project.tracks.map((track) => {
+            if (track.id === destination.id) return { ...track, items: [...track.items, detached] };
+            return {
+              ...track,
+              items: track.items.map((item) =>
+                item.id === itemId ? { ...item, audioMuted: true, linkGroupId } : item,
+              ),
+            };
+          }),
+        },
+        selectedItemIds: [audioId],
+        revision: current.revision + 1,
+        ...pushPast(current),
+      }));
+      return audioId;
+    },
+
+    linkItems: (itemIds) =>
+      set((state) => {
+        if (itemIds.length < 2) return state;
+        const ids = new Set(itemIds);
+        const linkGroupId = createId<string>();
+        return {
+          project: mapItems(state.project, (item) => (ids.has(item.id) ? { ...item, linkGroupId } : item)),
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
+
+    unlinkItems: (itemIds) =>
+      set((state) => {
+        // Unlinking any member dissolves the whole group, so the partners don't
+        // stay half-linked to something that no longer follows them.
+        const ids = expandLinked(state.project, itemIds);
+        return {
+          project: mapItems(state.project, (item) => {
+            if (!ids.has(item.id) || !item.linkGroupId) return item;
+            const { linkGroupId: _dropped, ...rest } = item;
+            return rest as TrackItem;
+          }),
+          revision: state.revision + 1,
+          ...pushPast(state),
+        };
+      }),
 
     updateItemEffects: (itemId, effects) =>
       set((state) => ({
@@ -829,15 +1015,20 @@ export const useTimelineStore = create<TimelineState>()(
 
     trimItemRipple: (itemId, edge, newFrame) =>
       set((state) => {
+        // Linked partners are trimmed on their own tracks, each rippling its
+        // own downstream items (#99) — the shift works out the same because a
+        // linked pair shares timing.
+        const targets = expandLinked(state.project, [itemId]);
         const project = {
           ...state.project,
           tracks: state.project.tracks.map((track) => {
-            const target = track.items.find((i) => i.id === itemId);
+            const target = track.items.find((i) => targets.has(i.id));
             if (!target) return track;
             const oldEnd = target.startFrame + target.durationFrames;
+            const targetId = target.id;
             let shift = 0;
             const items = track.items.map((item) => {
-              if (item.id !== itemId) return item;
+              if (item.id !== targetId) return item;
               if (edge === "end") {
                 const newDuration = Math.max(1, Math.round(newFrame) - item.startFrame);
                 shift = newDuration - item.durationFrames;
@@ -854,7 +1045,7 @@ export const useTimelineStore = create<TimelineState>()(
             });
             // Shift downstream items (those starting at/after the old end) by the delta.
             const shifted = items.map((item) =>
-              item.id !== itemId && item.startFrame >= oldEnd
+              item.id !== targetId && item.startFrame >= oldEnd
                 ? { ...item, startFrame: Math.max(0, item.startFrame + shift) }
                 : item,
             );
@@ -866,15 +1057,20 @@ export const useTimelineStore = create<TimelineState>()(
 
     // Slip: shift a clip's source in-point without moving it on the timeline.
     slipItem: (itemId, deltaFrames) =>
-      set((state) => ({
-        project: mapItems(state.project, (item) =>
-          item.id === itemId && item.type === "clip"
-            ? { ...item, sourceInFrame: Math.max(0, item.sourceInFrame - Math.round(deltaFrames)) }
-            : item,
-        ),
-        revision: state.revision + 1,
-        ...pushPastCoalesced(state, "slip"),
-      })),
+      set((state) => {
+        // Slipping only the picture of a linked pair would break lip sync, so
+        // partners slip by the same amount (#99).
+        const targets = expandLinked(state.project, [itemId]);
+        return {
+          project: mapItems(state.project, (item) =>
+            targets.has(item.id) && item.type === "clip"
+              ? { ...item, sourceInFrame: Math.max(0, item.sourceInFrame - Math.round(deltaFrames)) }
+              : item,
+          ),
+          revision: state.revision + 1,
+          ...pushPastCoalesced(state, "slip"),
+        };
+      }),
 
     // Roll: move the shared edit point between a clip and its adjacent neighbor.
     rollItem: (itemId, deltaFrames) =>
@@ -1232,6 +1428,7 @@ export const useTimelineStore = create<TimelineState>()(
         const entries = collectSelection(state);
         if (entries.length === 0) return state;
         const newIds: TrackItemId[] = [];
+        const relink = remapLinkGroups(entries.map((e) => e.item));
         const tracks = state.project.tracks.map((track) => {
           const dupes = entries
             .filter((e) => e.trackId === track.id)
@@ -1239,7 +1436,8 @@ export const useTimelineStore = create<TimelineState>()(
               const id = createId<TrackItemId>();
               newIds.push(id);
               // Place the copy immediately after the original on the same track.
-              return { ...e.item, id, startFrame: e.item.startFrame + e.item.durationFrames } as TrackItem;
+              const clone = { ...e.item, id, startFrame: e.item.startFrame + e.item.durationFrames } as TrackItem;
+              return withRemappedLink(clone, relink);
             });
           return dupes.length > 0 ? { ...track, items: [...track.items, ...dupes] } : track;
         });
@@ -1258,17 +1456,21 @@ export const useTimelineStore = create<TimelineState>()(
         const minStart = Math.min(...entries.map((e) => e.item.startFrame));
         const delta = Math.round(transport.getFrame()) - minStart;
         const newIds: TrackItemId[] = [];
+        const relink = remapLinkGroups(entries.map((e) => e.item));
         let tracks = state.project.tracks;
         for (const entry of entries) {
           const target = targetTrackFor(tracks, entry.trackId, entry.item);
           if (!target) continue;
           const id = createId<TrackItemId>();
           newIds.push(id);
-          const pasted = {
-            ...entry.item,
-            id,
-            startFrame: Math.max(0, entry.item.startFrame + delta),
-          } as TrackItem;
+          const pasted = withRemappedLink(
+            {
+              ...entry.item,
+              id,
+              startFrame: Math.max(0, entry.item.startFrame + delta),
+            } as TrackItem,
+            relink,
+          );
           tracks = tracks.map((track) =>
             track.id === target.id ? { ...track, items: [...track.items, pasted] } : track,
           );
