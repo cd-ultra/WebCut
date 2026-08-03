@@ -39,7 +39,11 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    exclude: ["onnxruntime-web"],
+    // Both packages resolve their own .wasm / .onnx artifacts at runtime and
+    // fail if esbuild pre-bundles them. transformers.js is >40 MB and is
+    // dynamically imported by the transcription service so it never touches
+    // the initial page load.
+    exclude: ["onnxruntime-web", "@xenova/transformers"],
   },
   build: {
     target: "es2022",
