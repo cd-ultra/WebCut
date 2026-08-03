@@ -27,6 +27,7 @@ import {
   type AnimatableValue,
   type ClipItem,
   type ColorGrade,
+  type Transition,
   type Effect,
   type Keyframe,
   type KeyframeId,
@@ -255,6 +256,8 @@ export interface TimelineState {
   applyGradeToSelection(grade: ColorGrade): void;
   // audio automation (#53 ducking)
   setClipGainKeyframes(itemId: TrackItemId, keyframes: readonly Keyframe<number>[]): void;
+  // transitions (#6): edge must be "in" or "out"; null clears the transition.
+  setClipTransition(itemId: TrackItemId, edge: "in" | "out", transition: Transition | null): void;
   // clipboard + history
   copySelection(): void;
   cutSelection(): void;
@@ -1049,6 +1052,22 @@ export const useTimelineStore = create<TimelineState>()(
           ...pushPast(state),
         };
       }),
+
+    // -- transitions (#6) -------------------------------------------------------
+
+    setClipTransition: (itemId, edge, transition) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) => {
+          if (item.id !== itemId || item.type !== "clip") return item;
+          const key = edge === "in" ? "transitionIn" : "transitionOut";
+          if (transition) return { ...item, [key]: transition } as TrackItem;
+          const { transitionIn, transitionOut, ...rest } = item;
+          void (edge === "in" ? transitionOut : transitionIn);
+          return (edge === "in" ? { ...rest, transitionOut } : { ...rest, transitionIn }) as TrackItem;
+        }),
+        revision: state.revision + 1,
+        ...pushPast(state),
+      })),
 
     // -- audio automation (#53 ducking) -----------------------------------------
 

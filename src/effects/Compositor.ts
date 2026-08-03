@@ -21,6 +21,7 @@ import {
   writeCurveLutTexture,
   writeLut3dTexture,
   type CorridorKeyPassResources,
+  type TransitionUniform,
 } from "./CorridorKeyShader";
 import { bakeCurveLut, curvesNeedLut, getLut } from "./lut";
 import {
@@ -28,6 +29,7 @@ import {
   type BlendMode,
   type ColorGrade,
   type CorridorKeyParams,
+  type EffectParams,
 } from "../types/timeline";
 
 export interface RendererInit {
@@ -53,6 +55,10 @@ export interface LayerState {
   lut3dTexture: GPUTexture | null;
   /** Edge length of the current 3D LUT (for shader half-texel correction). */
   lut3dSize: number;
+  /** Per-frame transition state (fade alpha, wipe kind + progress). */
+  transition: TransitionUniform | null;
+  /** Per-frame reduced effect params (b/c/blur/sharpen). */
+  effectParams: EffectParams | null;
 }
 
 export class WebGPUCompositor {
@@ -104,11 +110,25 @@ export class WebGPUCompositor {
         curveLutTexture: null,
         lut3dTexture: null,
         lut3dSize: 2,
+        transition: null,
+        effectParams: null,
       };
       this.layers.set(layerId, layer);
     }
     layer.order = order;
     return layer;
+  }
+
+  setLayerTransition(layerId: string, transition: TransitionUniform | null): void {
+    if (this.destroyed) return;
+    const layer = this.ensureLayer(layerId, this.layers.get(layerId)?.order ?? 0);
+    layer.transition = transition;
+  }
+
+  setLayerEffectParams(layerId: string, params: EffectParams | null): void {
+    if (this.destroyed) return;
+    const layer = this.ensureLayer(layerId, this.layers.get(layerId)?.order ?? 0);
+    layer.effectParams = params;
   }
 
   setLayerBlend(layerId: string, mode: BlendMode): void {
@@ -243,6 +263,8 @@ export class WebGPUCompositor {
           layer.height,
           layer.grade,
           layer.lut3dSize,
+          layer.transition,
+          layer.effectParams,
         ),
       );
     }

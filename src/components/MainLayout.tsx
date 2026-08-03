@@ -83,18 +83,22 @@ import {
   type MediaAsset,
   type MediaAssetId,
   type MediaKind,
+  type AnimatableValue,
   type ShapeItem,
   type TextItem,
   type Track,
   type TrackItem,
   type TrackItemId,
+  type TransitionKind,
   type Transform,
   type Vec2,
 } from "../types/timeline";
 import type { TransformProp } from "../store/timelineStore";
 import { chordFromEvent, COMMANDS, prettyChord, resetBindings, setBinding, useKeymap, type CommandId } from "../store/keymap";
 import { evalCurve, parseCubeLut, registerLut } from "../effects/lut";
-import { exportProject, projectEndFrame, type ExportFormat, type ExportProgress } from "../services/ExportService";
+import { projectEndFrame, type ExportFormat } from "../services/ExportService";
+import { EXPORT_PRESETS, type ExportPreset } from "../services/ExportPresets";
+import { exportQueue, type ExportJob } from "../services/ExportQueue";
 import { getWaveform } from "../services/waveform";
 import {
   computeDuckingKeyframes,
@@ -909,6 +913,175 @@ const ClipSection = ({ item, updateItem }: { item: TrackItem; updateItem: Update
 };
 
 // ---------------------------------------------------------------------------
+// Effects panel (#12): add / reorder / enable / tune stackable effects
+// ---------------------------------------------------------------------------
+
+const EFFECT_LABELS: Record<Effect["type"], string> = {
+  "corridor-key": "Corridor key",
+  "brightness-contrast": "Brightness / Contrast",
+  "gaussian-blur": "Gaussian blur",
+  "sharpen": "Sharpen",
+};
+
+const makeEffect = (type: Effect["type"]): Effect => {
+  const id = createId<EffectId>();
+  if (type === "brightness-contrast") {
+    return { id, type, enabled: true, params: { brightness: staticValue(0), contrast: staticValue(1) } };
+  }
+  if (type === "gaussian-blur") {
+    return { id, type, enabled: true, params: { radiusPx: staticValue(2) } };
+  }
+  if (type === "sharpen") {
+    return { id, type, enabled: true, params: { amount: staticValue(0.5) } };
+  }
+  return { id, type: "corridor-key", enabled: true, params: defaultCorridorKeyParams() };
+};
+
+const EffectsSection = ({ item }: { item: TrackItem }) => {
+  const updateItemEffects = useTimelineStore((s) => s.updateItemEffects);
+  if (item.type !== "clip") return null;
+  const effects = item.effects;
+
+  const add = (type: Effect["type"]) => {
+    updateItemEffects(item.id, [...effects, makeEffect(type)]);
+  };
+  const patchEffect = (idx: number, patch: (e: Effect) => Effect) => {
+    updateItemEffects(item.id, effects.map((e, i) => (i === idx ? patch(e) : e)));
+  };
+  const removeAt = (idx: number) => {
+    updateItemEffects(item.id, effects.filter((_, i) => i !== idx));
+  };
+  const move = (idx: number, dir: -1 | 1) => {
+    const j = idx + dir;
+    if (j < 0 || j >= effects.length) return;
+    const next = [...effects];
+    [next[idx], next[j]] = [next[j], next[idx]];
+    updateItemEffects(item.id, next);
+  };
+
+  const numOf = (av: AnimatableValue<number>): number => (av.kind === "static" ? av.value : av.keyframes[0]?.value ?? 0);
+  const setNumParam = (idx: number, key: string, value: number) => {
+    patchEffect(idx, (e) => {
+      const eAny = e as unknown as { params: Record<string, AnimatableValue<number>> };
+      return { ...e, params: { ...eAny.params, [key]: staticValue(value) } } as Effect;
+    });
+  };
+
+  return (
+    <Section title="Effects">
+      {effects.length === 0 && (
+        <p className="mb-1 text-[10px] text-neutral-600">No effects. Add one below.</p>
+      )}
+      {effects.map((e, idx) => (
+        <div key={e.id} className="mb-1.5 rounded border border-edge bg-panel/40 p-1.5">
+          <div className="mb-1 flex items-center gap-1">
+            <input
+              type="checkbox"
+              checked={e.enabled}
+              onChange={(ev) => patchEffect(idx, (x) => ({ ...x, enabled: ev.target.checked }) as Effect)}
+              className="accent-(--color-accent)"
+            />
+            <span className="flex-1 truncate text-[10px] text-neutral-300">{EFFECT_LABELS[e.type]}</span>
+            <button onClick={() => move(idx, -1)} disabled={idx === 0} className="rounded border border-edge px-1 text-[9px] text-neutral-500 hover:border-accent/60 disabled:opacity-30">↑</button>
+            <button onClick={() => move(idx, +1)} disabled={idx === effects.length - 1} className="rounded border border-edge px-1 text-[9px] text-neutral-500 hover:border-accent/60 disabled:opacity-30">↓</button>
+            <button onClick={() => removeAt(idx)} className="rounded border border-edge px-1 text-[9px] text-neutral-500 hover:border-red-500/60">✕</button>
+          </div>
+          {e.type === "brightness-contrast" && (
+            <>
+              <SliderRow label="Brightness" value={numOf(e.params.brightness)} min={-0.5} max={0.5} step={0.01} onChange={(v) => setNumParam(idx, "brightness", v)} />
+              <SliderRow label="Contrast" value={numOf(e.params.contrast)} min={0} max={3} step={0.01} onChange={(v) => setNumParam(idx, "contrast", v)} />
+            </>
+          )}
+          {e.type === "gaussian-blur" && (
+            <SliderRow label="Radius (px)" value={numOf(e.params.radiusPx)} min={0} max={16} step={0.5} onChange={(v) => setNumParam(idx, "radiusPx", v)} />
+          )}
+          {e.type === "sharpen" && (
+            <SliderRow label="Amount" value={numOf(e.params.amount)} min={0} max={3} step={0.05} onChange={(v) => setNumParam(idx, "amount", v)} />
+          )}
+          {e.type === "corridor-key" && (
+            <p className="text-[9px] text-neutral-600">Tune the matte in the CorridorKey section below.</p>
+          )}
+        </div>
+      ))}
+      <select
+        value=""
+        onChange={(ev) => { if (ev.target.value) { add(ev.target.value as Effect["type"]); ev.target.value = ""; } }}
+        className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[10px] text-neutral-300"
+      >
+        <option value="">Add effect…</option>
+        <option value="brightness-contrast">Brightness / Contrast</option>
+        <option value="gaussian-blur">Gaussian blur</option>
+        <option value="sharpen">Sharpen</option>
+      </select>
+    </Section>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Transitions (#6): crossfade / dissolve / wipe applied at a clip's edge
+// ---------------------------------------------------------------------------
+
+const TRANSITION_KINDS: readonly TransitionKind[] = ["fade", "wipe-left", "wipe-right", "wipe-up", "wipe-down"];
+
+const TransitionSection = ({ item }: { item: TrackItem }) => {
+  const setClipTransition = useTimelineStore((s) => s.setClipTransition);
+  const fps = useTimelineStore((s) => s.project.settings.frameRate);
+  if (item.type !== "clip") return null;
+  const clip = item;
+
+  const renderEdge = (edge: "in" | "out") => {
+    const t = edge === "in" ? clip.transitionIn : clip.transitionOut;
+    return (
+      <div className="mb-2">
+        <div className="mb-1 flex items-center justify-between">
+          <span className="text-[10px] text-neutral-400">{edge === "in" ? "In edge" : "Out edge"}</span>
+          {t && (
+            <button onClick={() => setClipTransition(clip.id, edge, null)} className="rounded border border-edge px-1.5 py-0.5 text-[9px] text-neutral-500 hover:border-red-500/60">
+              Remove
+            </button>
+          )}
+        </div>
+        <div className="flex flex-wrap gap-1">
+          {TRANSITION_KINDS.map((k) => {
+            const active = t?.kind === k;
+            return (
+              <button
+                key={k}
+                onClick={() => setClipTransition(clip.id, edge, { kind: k, frames: t?.frames ?? Math.round(fps * 0.5) })}
+                className={`rounded px-1.5 py-0.5 text-[9px] ${active ? "bg-accent/30 text-accent" : "border border-edge text-neutral-400 hover:border-accent/60"}`}
+              >
+                {k === "fade" ? "Fade" : k.replace("wipe-", "▶ ").replace("left", "L").replace("right", "R").replace("up", "U").replace("down", "D")}
+              </button>
+            );
+          })}
+        </div>
+        {t && (
+          <SliderRow
+            label="Duration (frames)"
+            value={t.frames}
+            min={1}
+            max={Math.max(1, Math.round(fps * 3))}
+            step={1}
+            onChange={(v) => setClipTransition(clip.id, edge, { ...t, frames: Math.max(1, Math.round(v)) })}
+          />
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <Section title="Transitions">
+      <p className="mb-1.5 text-[9px] leading-tight text-neutral-600">
+        Applied where this clip overlaps a neighbor on the same track. Fade cross-mixes both clips;
+        wipes reveal this clip across the frame.
+      </p>
+      {renderEdge("in")}
+      {renderEdge("out")}
+    </Section>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Retime: speed ramp (#52) + freeze frame (#55)
 // ---------------------------------------------------------------------------
 
@@ -1395,6 +1568,8 @@ const Inspector = () => {
             <TextSection item={selectedItem} updateItem={updateItem} />
             <ShapeSection item={selectedItem} updateItem={updateItem} />
             <ClipSection item={selectedItem} updateItem={updateItem} />
+            <EffectsSection item={selectedItem} />
+            <TransitionSection item={selectedItem} />
             <SpeedSection item={selectedItem} />
             <ColorSection item={selectedItem} updateItem={updateItem} />
             <BlendSection item={selectedItem} updateItem={updateItem} />
@@ -1962,123 +2137,205 @@ const ExportPanel = ({ onClose, onStatus }: { onClose: () => void; onStatus: (ms
   const [scale, setScale] = useState(1);
   const [fps, setFps] = useState(project.settings.frameRate);
   const [mbps, setMbps] = useState(12);
-  const [progress, setProgress] = useState<ExportProgress | null>(null);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  const [jobs, setJobs] = useState<readonly ExportJob[]>(exportQueue.getJobs());
 
   const width = Math.round((project.settings.width * scale) / 2) * 2;
   const height = Math.round((project.settings.height * scale) / 2) * 2;
   const endFrame = projectEndFrame(project);
   const durationSec = endFrame / project.settings.frameRate;
+  const hasRunning = jobs.some((j) => j.status === "running" || j.status === "pending");
 
-  const run = async () => {
+  // On completion, auto-save + status flash. Chapters (if any) drop as a
+  // WebVTT sidecar via anchor-download so they don't compete with the video's
+  // Save dialog.
+  useEffect(() => {
+    exportQueue.setOnFinished((job) => {
+      if (!job.result) return;
+      void saveBlob(job.result.blob, job.result.filename);
+      if (job.result.chaptersVtt) {
+        const vtt = new Blob([job.result.chaptersVtt], { type: "text/vtt" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(vtt);
+        a.download = `${job.result.filename}.chapters.vtt`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+      }
+      onStatus(`Exported ${job.result.filename} (${(job.result.blob.size / 1e6).toFixed(1)} MB)`);
+    });
+    const unsub = exportQueue.subscribe(setJobs);
+    return () => {
+      exportQueue.setOnFinished(null);
+      unsub();
+    };
+  }, [onStatus]);
+
+  const enqueueCurrent = () => {
     if (endFrame <= 0) {
       setError("Timeline is empty — add clips before exporting.");
       return;
     }
     setError(null);
-    setBusy(true);
-    const controller = new AbortController();
-    abortRef.current = controller;
-    try {
-      const { blob, filename } = await exportProject(
-        project,
-        { width, height, frameRate: fps, format, videoBitrate: mbps * 1_000_000, startFrame: 0, endFrame },
-        setProgress,
-        controller.signal,
-      );
-      await saveBlob(blob, filename);
-      onStatus(`Exported ${filename} (${(blob.size / 1e6).toFixed(1)} MB)`);
-      onClose();
-    } catch (err) {
-      if ((err as DOMException).name === "AbortError") {
-        onStatus("Export cancelled");
-        onClose();
-      } else {
-        console.error("[WebCut] export failed:", err);
-        setError(err instanceof Error ? err.message : String(err));
-      }
-    } finally {
-      setBusy(false);
-      setProgress(null);
-      abortRef.current = null;
-    }
+    exportQueue.enqueue(`${format.toUpperCase()} ${width}×${height}@${fps}`, {
+      width, height, frameRate: fps, format, videoBitrate: mbps * 1_000_000, startFrame: 0, endFrame,
+    });
+    void exportQueue.runAll(project);
   };
 
-  const pct = progress ? Math.round((progress.frame / progress.totalFrames) * 100) : 0;
+  const addPreset = (preset: ExportPreset) => {
+    if (endFrame <= 0) {
+      setError("Timeline is empty — add clips before exporting.");
+      return;
+    }
+    setError(null);
+    exportQueue.enqueueFromPreset(project, preset);
+    void exportQueue.runAll(project);
+  };
+
+  const groups = Array.from(new Set(EXPORT_PRESETS.map((p) => p.group)));
 
   return (
-    <Modal title="EXPORT VIDEO" icon={<Download size={14} className="text-accent-warm" />} onClose={busy ? () => {} : onClose}>
-      <div className="space-y-3">
-        <div className="grid grid-cols-2 gap-2">
-          <label className="block">
-            <span className="mb-1 block text-[10px] text-neutral-400">Format</span>
-            <select value={format} onChange={(e) => setFormat(e.target.value as ExportFormat)} disabled={busy} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
-              <option value="mp4">MP4 (H.264 / AAC)</option>
-              <option value="webm">WebM (VP9 / Opus)</option>
-            </select>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-[10px] text-neutral-400">Resolution</span>
-            <select value={scale} onChange={(e) => setScale(Number(e.target.value))} disabled={busy} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
-              <option value={1}>100% ({project.settings.width}×{project.settings.height})</option>
-              <option value={0.75}>75%</option>
-              <option value={0.5}>50%</option>
-            </select>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-[10px] text-neutral-400">Frame rate</span>
-            <select value={fps} onChange={(e) => setFps(Number(e.target.value))} disabled={busy} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
-              {[24, 25, 30, 50, 60].map((r) => <option key={r} value={r}>{r} fps</option>)}
-            </select>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-[10px] text-neutral-400">Bitrate</span>
-            <select value={mbps} onChange={(e) => setMbps(Number(e.target.value))} disabled={busy} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
-              {[4, 8, 12, 20, 40].map((m) => <option key={m} value={m}>{m} Mbps</option>)}
-            </select>
-          </label>
-        </div>
-
-        <p className="text-[10px] text-neutral-500">
-          {width}×{height} · {fps} fps · {durationSec.toFixed(1)}s · whole timeline ({endFrame} frames)
-        </p>
-
-        {busy && progress && (
-          <div>
-            <div className="mb-1 flex justify-between text-[10px] text-neutral-400">
-              <span className="capitalize">{progress.phase}…</span>
-              <span className="font-mono">{pct}%</span>
-            </div>
-            <div className="h-2 w-full overflow-hidden rounded bg-panel-raised">
-              <div className="h-full bg-accent-warm transition-[width]" style={{ width: `${pct}%` }} />
-            </div>
+    <Modal title="EXPORT VIDEO" icon={<Download size={14} className="text-accent-warm" />} onClose={onClose} wide>
+      <div className="grid grid-cols-2 gap-4">
+        {/* Left column: custom export + presets */}
+        <div className="space-y-3">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Custom</p>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block">
+              <span className="mb-1 block text-[10px] text-neutral-400">Format</span>
+              <select value={format} onChange={(e) => setFormat(e.target.value as ExportFormat)} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
+                <option value="mp4">MP4 (H.264 / AAC)</option>
+                <option value="webm">WebM (VP9 / Opus)</option>
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[10px] text-neutral-400">Resolution</span>
+              <select value={scale} onChange={(e) => setScale(Number(e.target.value))} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
+                <option value={1}>100% ({project.settings.width}×{project.settings.height})</option>
+                <option value={0.75}>75%</option>
+                <option value={0.5}>50%</option>
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[10px] text-neutral-400">Frame rate</span>
+              <select value={fps} onChange={(e) => setFps(Number(e.target.value))} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
+                {[24, 25, 30, 50, 60].map((r) => <option key={r} value={r}>{r} fps</option>)}
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[10px] text-neutral-400">Bitrate</span>
+              <select value={mbps} onChange={(e) => setMbps(Number(e.target.value))} className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200">
+                {[4, 8, 12, 20, 40, 80].map((m) => <option key={m} value={m}>{m} Mbps</option>)}
+              </select>
+            </label>
           </div>
-        )}
+          <p className="text-[10px] text-neutral-500">
+            {width}×{height} · {fps} fps · {durationSec.toFixed(1)}s · whole timeline ({endFrame} frames)
+          </p>
+          <button onClick={enqueueCurrent} className="w-full rounded bg-accent-warm/90 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-accent-warm">
+            Queue custom export
+          </button>
 
-        {error && <p className="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[10px] text-red-300">{error}</p>}
+          <div className="border-t border-edge/50 pt-2">
+            <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Platform presets</p>
+            {groups.map((group) => (
+              <div key={group} className="mb-2">
+                <p className="mb-0.5 text-[9px] uppercase tracking-wide text-neutral-600">{group}</p>
+                <div className="flex flex-wrap gap-1">
+                  {EXPORT_PRESETS.filter((p) => p.group === group).map((p) => (
+                    <button
+                      key={p.id}
+                      onClick={() => addPreset(p)}
+                      title={`${p.options.width}×${p.options.height} @ ${p.options.frameRate}fps · ${(p.options.videoBitrate / 1e6).toFixed(0)} Mbps`}
+                      className="rounded border border-edge px-1.5 py-0.5 text-[10px] text-neutral-300 hover:border-accent-warm/70 hover:bg-accent-warm/10"
+                    >
+                      {p.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
 
-        <div className="flex gap-2">
-          {busy ? (
-            <button onClick={() => abortRef.current?.abort()} className="flex-1 rounded border border-edge px-3 py-1.5 text-[11px] text-neutral-300 hover:border-red-500/60">
-              Cancel
-            </button>
-          ) : (
-            <>
-              <button onClick={onClose} className="rounded border border-edge px-3 py-1.5 text-[11px] text-neutral-400 hover:border-accent/60">Close</button>
-              <button onClick={run} className="flex-1 rounded bg-accent-warm/90 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-accent-warm">
-                Export
-              </button>
-            </>
-          )}
+          {error && <p className="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[10px] text-red-300">{error}</p>}
         </div>
 
-        <p className="text-[10px] leading-relaxed text-neutral-600">
-          Renders through the same WebGPU compositor as the preview, encodes with WebCodecs, and mixes
-          all audio tracks (gain, ramps, pan, speed). Export runs slower than realtime — it seeks each
-          source frame for exactness. Requires a Chromium-based browser with WebCodecs.
-        </p>
+        {/* Right column: job queue */}
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Queue</p>
+            <button onClick={() => exportQueue.clearFinished()} className="text-[9px] text-neutral-500 hover:text-neutral-300">Clear finished</button>
+          </div>
+          {jobs.length === 0 && (
+            <p className="rounded border border-dashed border-edge/70 p-3 text-center text-[10px] text-neutral-600">
+              Queue is empty. Add exports from the left, or click a preset.
+            </p>
+          )}
+          <div className="max-h-[50vh] space-y-1.5 overflow-y-auto pr-1">
+            {jobs.map((job) => {
+              const pct = job.progress ? Math.round((job.progress.frame / job.progress.totalFrames) * 100) : 0;
+              return (
+                <div key={job.id} className="rounded border border-edge bg-panel/40 p-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-[10px] text-neutral-200">{job.presetName}</span>
+                    <span className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] uppercase ${
+                      job.status === "done" ? "bg-emerald-500/25 text-emerald-300"
+                      : job.status === "error" ? "bg-red-500/25 text-red-300"
+                      : job.status === "cancelled" ? "bg-neutral-500/25 text-neutral-400"
+                      : job.status === "running" ? "bg-accent-warm/25 text-accent-warm"
+                      : "bg-neutral-500/15 text-neutral-500"
+                    }`}>{job.status}</span>
+                  </div>
+                  <p className="mt-0.5 font-mono text-[9px] text-neutral-500">
+                    {job.options.width}×{job.options.height} · {job.options.frameRate}fps · {(job.options.videoBitrate / 1e6).toFixed(0)}Mbps · {job.options.format}
+                  </p>
+                  {(job.status === "running" || job.status === "pending") && (
+                    <div className="mt-1">
+                      <div className="mb-0.5 flex justify-between text-[9px] text-neutral-500">
+                        <span className="capitalize">{job.progress?.phase ?? "queued"}</span>
+                        <span className="font-mono">{pct}%</span>
+                      </div>
+                      <div className="h-1 w-full overflow-hidden rounded bg-panel-raised">
+                        <div className="h-full bg-accent-warm transition-[width]" style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  )}
+                  {job.error && <p className="mt-1 text-[9px] text-red-400">{job.error}</p>}
+                  {job.status === "done" && job.result && (
+                    <p className="mt-1 text-[9px] text-neutral-500">Saved · {(job.result.blob.size / 1e6).toFixed(1)} MB</p>
+                  )}
+                  <div className="mt-1 flex gap-1">
+                    {(job.status === "running" || job.status === "pending") && (
+                      <button onClick={() => exportQueue.cancel(job.id)} className="rounded border border-edge px-1.5 py-0.5 text-[9px] text-neutral-400 hover:border-red-500/60">
+                        Cancel
+                      </button>
+                    )}
+                    {job.status !== "running" && (
+                      <button onClick={() => exportQueue.remove(job.id)} className="rounded border border-edge px-1.5 py-0.5 text-[9px] text-neutral-500 hover:border-accent/60">
+                        Remove
+                      </button>
+                    )}
+                    {job.status === "done" && job.result && (
+                      <button onClick={() => void saveBlob(job.result!.blob, job.result!.filename)} className="rounded border border-edge px-1.5 py-0.5 text-[9px] text-neutral-300 hover:border-accent/60">
+                        Save again
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <p className="text-[10px] leading-relaxed text-neutral-600">
+            Jobs run sequentially through the shared WebGPU compositor. Each completed export is
+            offered via the Save dialog automatically; cancel one without stopping the rest.
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-3 flex justify-end border-t border-edge/50 pt-2">
+        <button onClick={onClose} disabled={hasRunning} className="rounded border border-edge px-3 py-1 text-[11px] text-neutral-400 hover:border-accent/60 disabled:opacity-40">
+          {hasRunning ? "Exports running…" : "Close"}
+        </button>
       </div>
     </Modal>
   );

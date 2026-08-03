@@ -19,6 +19,7 @@ import {
   defaultCorridorKeyParams,
   integrateClipSource,
   isOverlayItem,
+  reduceEffects,
   sampleAnimatable,
   sampleClipSpeed,
   type BlendMode,
@@ -50,6 +51,8 @@ export interface FrameSink {
   setLayerEffect(layerId: string, enabled: boolean, params: CorridorKeyParams): void;
   setLayerBlend(layerId: string, mode: BlendMode): void;
   setLayerGrade(layerId: string, grade: ColorGrade | null): void;
+  setLayerTransition(layerId: string, transition: import("../effects/CorridorKeyShader").TransitionUniform | null): void;
+  setLayerEffectParams(layerId: string, params: import("../types/timeline").EffectParams | null): void;
   /** Reconcile live layers; anything absent from the list is destroyed. */
   syncLayers(activeLayerIds: readonly string[]): void;
 }
@@ -65,11 +68,15 @@ export interface ActiveLayerClip {
   readonly clip: ClipItem;
   readonly asset: MediaAsset;
   readonly trackId: string;
+  /** Per-active-clip layer id; distinct from `trackId` so two clips can co-exist during a transition. */
+  readonly layerId: string;
   readonly trackMuted: boolean;
   /** Track-level mixer trim (dB), summed with per-clip gain. */
   readonly trackGainDb: number;
   /** Compositing order: ascending = bottom -> top. */
   readonly order: number;
+  /** Per-frame transition uniform, or null when the clip isn't in a transition. */
+  readonly transition: import("../effects/CorridorKeyShader").TransitionUniform | null;
 }
 
 export interface ActiveOverlay {
@@ -82,23 +89,85 @@ export interface ActiveOverlay {
 /** Max playhead/element drift before a hard re-seek during playback (seconds). */
 const DRIFT_TOLERANCE_S = 0.12;
 
+/** Numeric encoding of a transition kind for the shader uniform. */
+const TRANSITION_KIND: Record<string, number> = {
+  fade: 1,
+  "wipe-left": 2,
+  "wipe-right": 3,
+  "wipe-up": 4,
+  "wipe-down": 5,
+};
+
 export const resolveActiveClips = (project: Project, frame: number): ActiveLayerClip[] => {
   const wholeFrame = Math.floor(frame);
-  // Every visible video track contributes one layer, bottom (index 0) first;
-  // upper layers composite over lower ones with premultiplied alpha, so a
-  // keyed clip on V2 reveals V1 through its transparent matte.
+  // Every visible video track contributes at least one layer, bottom (index 0)
+  // first; upper layers composite over lower ones with premultiplied alpha, so
+  // a keyed clip on V2 reveals V1 through its transparent matte. During a
+  // transition, both the outgoing and incoming clip on the SAME track are
+  // active — each gets its own layer id + transition uniform.
   const visualTracks = project.tracks
     .filter((track) => track.kind === "video" && !track.hidden)
     .sort((a, b) => a.index - b.index);
   const layers: ActiveLayerClip[] = [];
   for (const track of visualTracks) {
+    const activeClips: ClipItem[] = [];
     for (const item of track.items) {
       if (item.type !== "clip") continue;
       if (wholeFrame < item.startFrame || wholeFrame >= item.startFrame + item.durationFrames) continue;
-      const asset = project.assets.find((candidate) => candidate.id === item.assetId);
+      activeClips.push(item);
+    }
+    if (activeClips.length === 0) continue;
+
+    // Order by startFrame so index 0 is the outgoing clip when there's overlap.
+    activeClips.sort((a, b) => a.startFrame - b.startFrame);
+
+    for (let i = 0; i < activeClips.length; i++) {
+      const clip = activeClips[i];
+      const asset = project.assets.find((candidate) => candidate.id === clip.assetId);
       if (!asset || asset.kind === "audio") continue;
-      layers.push({ clip: item, asset, trackId: track.id, trackMuted: track.muted, trackGainDb: track.gainDb ?? 0, order: track.index });
-      break;
+
+      // Transition uniform: only set for a pair of overlapping clips where the
+      // later one carries `transitionIn`. The earlier clip becomes "outgoing".
+      let transition: import("../effects/CorridorKeyShader").TransitionUniform | null = null;
+      if (i > 0 && clip.transitionIn) {
+        const t = clip.transitionIn;
+        const N = Math.max(1, t.frames);
+        const progress = Math.max(0, Math.min(1, (wholeFrame - clip.startFrame) / N));
+        if (progress < 1) {
+          const kind = TRANSITION_KIND[t.kind] ?? 1;
+          if (t.kind === "fade") {
+            transition = { alpha: progress, kind: 0, progress: 0 };
+          } else {
+            transition = { alpha: 1, kind, progress };
+          }
+        }
+      } else if (i + 1 < activeClips.length && activeClips[i + 1].transitionIn) {
+        const incoming = activeClips[i + 1];
+        const t = incoming.transitionIn;
+        if (t) {
+          const N = Math.max(1, t.frames);
+          const progress = Math.max(0, Math.min(1, (wholeFrame - incoming.startFrame) / N));
+          if (progress < 1 && t.kind === "fade") {
+            transition = { alpha: 1 - progress, kind: 0, progress: 0 };
+          } else if (progress < 1) {
+            // For a wipe, the outgoing clip stays fully opaque underneath the incoming wipe edge.
+            transition = { alpha: 1, kind: 0, progress: 0 };
+          }
+        }
+      }
+
+      // Sub-order: outgoing (i=0) below, incoming (i=1) above — so a wipe reveals correctly.
+      const order = track.index + i * 0.001;
+      layers.push({
+        clip,
+        asset,
+        trackId: track.id,
+        layerId: `${track.id}:${clip.id}`,
+        trackMuted: track.muted,
+        trackGainDb: track.gainDb ?? 0,
+        order,
+        transition,
+      });
     }
   }
   return layers;
@@ -211,7 +280,7 @@ class PreviewService {
 
     const BG_ID = "__bg";
     const SUB_ID = "__subtitle";
-    const layerIds = [...actives.map((layer) => layer.trackId), ...overlays.map((o) => o.layerId)];
+    const layerIds = [...actives.map((layer) => layer.layerId), ...overlays.map((o) => o.layerId)];
     if (bgGradient) layerIds.push(BG_ID);
     if (activeSubtitle) layerIds.push(SUB_ID);
     sink.syncLayers(layerIds);
@@ -258,30 +327,35 @@ class PreviewService {
 
     const keepVideos = new Set<RVFCVideo>();
 
-    for (const { clip, asset, trackId, trackMuted, trackGainDb, order } of actives) {
+    for (const { clip, asset, trackId, layerId, trackMuted, trackGainDb, order, transition } of actives) {
       const key = corridorKeyOf(clip);
-      sink.setLayerEffect(trackId, key.enabled, key.params);
-      sink.setLayerBlend(trackId, clip.blendMode ?? "normal");
-      sink.setLayerGrade(trackId, clip.grade ?? null);
+      sink.setLayerEffect(layerId, key.enabled, key.params);
+      sink.setLayerBlend(layerId, clip.blendMode ?? "normal");
+      sink.setLayerGrade(layerId, clip.grade ?? null);
+      sink.setLayerTransition(layerId, transition);
+      sink.setLayerEffectParams(layerId, reduceEffects(clip.effects, frame - clip.startFrame));
 
       if (asset.kind === "image") {
         const bitmap = await this.getImageBitmap(asset);
-        if (bitmap) sink.ingestLayerFrame(trackId, bitmap, order);
+        if (bitmap) sink.ingestLayerFrame(layerId, bitmap, order);
         continue;
       }
 
-      // Cache per track: the same source file on two tracks needs two
-      // independent elements (each layer seeks its own media time).
-      const video = await this.getVideoElement(asset, `${trackId}:${asset.handleKey}`);
+      // Cache per layer: the same source file on two layers (e.g. two clips
+      // from the same asset overlapping during a transition) needs two
+      // independent elements, each seeking its own media time.
+      const video = await this.getVideoElement(asset, `${layerId}:${asset.handleKey}`);
       if (!video) continue;
       keepVideos.add(video);
 
       const localFrame = frame - clip.startFrame;
       // Per-clip audio: clip gain + keyframed gain ramp + track mixer trim.
-      // (Track mute overrides everything.)
+      // (Track mute overrides everything.) Fade audio with the transition.
       const rampDb = clip.gainRamp ? sampleAnimatable(clip.gainRamp, localFrame) : 0;
+      const transitionAlpha = transition?.alpha ?? 1;
       video.muted = clip.audioMuted || trackMuted;
-      video.volume = dbToVolume(clip.audioGainDb + rampDb + trackGainDb);
+      video.volume = dbToVolume(clip.audioGainDb + rampDb + trackGainDb) * transitionAlpha;
+      void trackId;
 
       // Ramp-aware source mapping: integrate the (possibly keyframed) speed.
       const instantSpeed = sampleClipSpeed(clip, localFrame);
@@ -300,7 +374,7 @@ class PreviewService {
             /* muted autoplay is permitted; ignore pause races */
           });
         }
-        this.ensureRvfcLoop(video, trackId, order);
+        this.ensureRvfcLoop(video, layerId, order);
       } else {
         this.stopRvfcLoop(video);
         if (!video.paused) video.pause();
@@ -308,12 +382,12 @@ class PreviewService {
           video.currentTime = clampedTimeS;
           const pushWhenSeeked = () => {
             if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-              this.sink?.ingestLayerFrame(trackId, video, order);
+              this.sink?.ingestLayerFrame(layerId, video, order);
             }
           };
           video.addEventListener("seeked", pushWhenSeeked, { once: true });
         } else if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-          sink.ingestLayerFrame(trackId, video, order);
+          sink.ingestLayerFrame(layerId, video, order);
         }
       }
     }

@@ -21,6 +21,7 @@
 import { ArrayBufferTarget as Mp4Target, Muxer as Mp4Muxer } from "mp4-muxer";
 import { ArrayBufferTarget as WebmTarget, Muxer as WebmMuxer } from "webm-muxer";
 import { WebGPUCompositor } from "../effects/Compositor";
+import { projectChaptersToWebVtt } from "./chapters";
 import { fileSystemService } from "./FileSystemService";
 import {
   corridorKeyOf,
@@ -34,6 +35,7 @@ import {
 } from "./PreviewService";
 import {
   defaultCorridorKeyParams,
+  reduceEffects,
   sampleAnimatable,
   sampleClipSpeed,
   type ClipItem,
@@ -65,6 +67,11 @@ export interface ExportProgress {
 export interface ExportResult {
   readonly blob: Blob;
   readonly filename: string;
+  /**
+   * WebVTT chapter sidecar (#72) — empty when the project has no markers in
+   * the export range. Saved alongside the video as `<filename>.chapters.vtt`.
+   */
+  readonly chaptersVtt: string;
 }
 
 const hexToRgb = (hex: string): [number, number, number] => {
@@ -236,18 +243,20 @@ export const exportProject = async (
       const overlays = resolveActiveOverlays(project, f);
       const activeIds: string[] = [];
 
-      for (const { clip, asset, trackId, order } of clips) {
+      for (const { clip, asset, layerId, order, transition } of clips) {
         const key = corridorKeyOf(clip);
-        compositor.setLayerEffect(trackId, key.enabled, key.params);
-        compositor.setLayerBlend(trackId, clip.blendMode ?? "normal");
-        compositor.setLayerGrade(trackId, clip.grade ?? null);
-        activeIds.push(trackId);
+        compositor.setLayerEffect(layerId, key.enabled, key.params);
+        compositor.setLayerBlend(layerId, clip.blendMode ?? "normal");
+        compositor.setLayerGrade(layerId, clip.grade ?? null);
+        compositor.setLayerTransition(layerId, transition);
+        compositor.setLayerEffectParams(layerId, reduceEffects(clip.effects, f - clip.startFrame));
+        activeIds.push(layerId);
         if (asset.kind === "image") {
           const bmp = await getImage(asset);
-          if (bmp) compositor.ingestLayerFrame(trackId, bmp, order);
+          if (bmp) compositor.ingestLayerFrame(layerId, bmp, order);
           continue;
         }
-        const el = await getVideoEl(asset, `${trackId}:${asset.handleKey}`);
+        const el = await getVideoEl(asset, `${layerId}:${asset.handleKey}`);
         const localFrame = f - clip.startFrame;
         const srcTime = (clip.sourceInFrame + localFrame * Math.abs(sampleClipSpeed(clip, localFrame))) / fps;
         const t = Math.min(Math.max(0, srcTime), Math.max(0, (el.duration || 0) - 1e-3));
@@ -255,7 +264,7 @@ export const exportProject = async (
           el.currentTime = t;
           await nextFrameEvent(el);
         }
-        compositor.ingestLayerFrame(trackId, el, order);
+        compositor.ingestLayerFrame(layerId, el, order);
       }
 
       for (const { item, layerId, order } of overlays) {
@@ -313,7 +322,8 @@ export const exportProject = async (
     const buffer = mp4Target ? mp4Target.buffer : webmTarget!.buffer;
     const blob = new Blob([buffer], { type: format === "mp4" ? "video/mp4" : "video/webm" });
     const filename = `${project.name.replace(/[^\w.-]+/g, "_") || "webcut"}.${format}`;
-    return { blob, filename };
+    const chaptersVtt = projectChaptersToWebVtt(project, startFrame, endFrame);
+    return { blob, filename, chaptersVtt };
   } finally {
     for (const url of objectUrls) URL.revokeObjectURL(url);
     for (const bmp of imageBitmaps.values()) bmp.close();
@@ -403,6 +413,20 @@ const mixAndEncodeAudio = async (
 
       const panner = ctx.createStereoPanner();
       panner.pan.value = Math.max(-1, Math.min(1, pan));
+
+      // Fade transitions apply an audio-side gain envelope too. Wipes leave
+      // audio at full volume — matches Premiere/FCP conventions.
+      if (clip.transitionIn && clip.transitionIn.kind === "fade") {
+        const dur = clip.transitionIn.frames / frameRate;
+        gainNode.gain.setValueAtTime(0, Math.max(0, when));
+        gainNode.gain.linearRampToValueAtTime(dbToVolume(baseDb), Math.max(0, when) + dur);
+      }
+      if (clip.transitionOut && clip.transitionOut.kind === "fade") {
+        const dur = clip.transitionOut.frames / frameRate;
+        const outStart = when + (clip.durationFrames - clip.transitionOut.frames) / frameRate;
+        gainNode.gain.setValueAtTime(dbToVolume(baseDb), Math.max(0, outStart));
+        gainNode.gain.linearRampToValueAtTime(0, Math.max(0, outStart) + dur);
+      }
 
       src.connect(gainNode).connect(panner).connect(ctx.destination);
       const offset = clip.sourceInFrame / frameRate;
