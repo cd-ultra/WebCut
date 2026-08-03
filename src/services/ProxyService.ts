@@ -291,12 +291,17 @@ export const proxyService = new ProxyServiceImpl();
 
 // Global toggle: preview uses proxies when enabled + available. Persists to
 // localStorage so it survives reloads.
+//
+// Defaults to OFF: generating a proxy opens a second decoder on the same source
+// the preview is already decoding, and browsers cap concurrent hardware
+// decoders — running both can black out the preview. Proxies are opt-in until
+// the pipeline is proven on the user's hardware.
 const PROXY_TOGGLE_KEY = "webcut.useProxies";
 
 let useProxies = ((): boolean => {
-  if (typeof localStorage === "undefined") return true;
+  if (typeof localStorage === "undefined") return false;
   const raw = localStorage.getItem(PROXY_TOGGLE_KEY);
-  return raw === null ? true : raw === "1";
+  return raw === null ? false : raw === "1";
 })();
 
 const toggleListeners = new Set<(useProxies: boolean) => void>();
