@@ -327,7 +327,7 @@ export const isIdentityEffectParams = (p: EffectParams): boolean =>
 // Media assets
 // ---------------------------------------------------------------------------
 
-export type MediaKind = "video" | "audio" | "image";
+export type MediaKind = "video" | "audio" | "image" | "sequence";
 
 export interface MediaAsset {
   readonly id: MediaAssetId;
@@ -344,6 +344,13 @@ export interface MediaAsset {
   readonly frameRate?: number;
   readonly mimeType: string;
   readonly fileSizeBytes: number;
+  /**
+   * Nested sequence (#50). Present when `kind === "sequence"` — an immutable
+   * snapshot of another Project. The sequence renders its overlays + image
+   * clips to a bitmap per frame and is composited as a normal layer source.
+   * Video clips inside a nested sequence are NOT rendered in this MVP.
+   */
+  readonly nestedProject?: Project;
   /**
    * Proxy media (#51): a smaller, faster-to-decode copy generated from the
    * source. Preview uses it when available; export always reads the original.

@@ -165,6 +165,7 @@ const MEDIA_ICONS: Record<MediaKind, typeof FileVideo> = {
   video: FileVideo,
   audio: FileAudio,
   image: ImageIcon,
+  sequence: LayoutTemplate,
 };
 
 const InsertButton = ({
@@ -3547,6 +3548,44 @@ export const MainLayout = () => {
     [withStatus, setProject],
   );
 
+  const createNestedSequence = useCallback(() => {
+    const state = useTimelineStore.getState();
+    const project = state.project;
+    // Only nest projects that have SOMETHING to render.
+    let hasContent = false;
+    for (const track of project.tracks) {
+      if (track.items.length > 0) { hasContent = true; break; }
+    }
+    if (!hasContent) {
+      flashStatus("Add clips to the timeline before nesting.");
+      return;
+    }
+    const name = prompt("Nested sequence name:", `Nested ${new Date().toLocaleTimeString()}`);
+    if (!name) return;
+
+    const snapshot: import("../types/timeline").Project = JSON.parse(JSON.stringify(project));
+    const asset: import("../types/timeline").MediaAsset = {
+      id: createId<import("../types/timeline").MediaAssetId>(),
+      kind: "sequence",
+      name,
+      handleKey: `sequence:${snapshot.id}`,
+      durationFrames: (() => {
+        let max = 0;
+        for (const track of project.tracks) {
+          for (const item of track.items) max = Math.max(max, item.startFrame + item.durationFrames);
+        }
+        return Math.max(1, max);
+      })(),
+      width: project.settings.width,
+      height: project.settings.height,
+      mimeType: "application/x-webcut-sequence",
+      fileSizeBytes: 0,
+      nestedProject: snapshot,
+    };
+    state.addAsset(asset);
+    flashStatus(`Nested sequence “${name}” added to media pool.`);
+  }, [flashStatus]);
+
   return (
     <div className="flex h-full flex-col bg-panel-deep text-sm">
       {/* App bar */}
@@ -3582,6 +3621,13 @@ export const MainLayout = () => {
         </button>
         <button onClick={() => setModal("motionTrack")} title="Motion tracking" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
           <Target size={12} />
+        </button>
+        <button
+          onClick={createNestedSequence}
+          title="Snapshot the current timeline as a nested sequence and add it to the media pool"
+          className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60"
+        >
+          Nest
         </button>
         <ProxyIndicator />
         <button
