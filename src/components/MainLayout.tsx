@@ -115,6 +115,7 @@ import {
 } from "../services/templates";
 import { getUseProxies, proxyService, setUseProxies, subscribeUseProxies, type ProxyJob } from "../services/ProxyService";
 import { trackPoint, type TrackSample } from "../services/motionTrack";
+import { analyzeStabilization } from "../services/stabilize";
 import { EXPORT_PRESETS, type ExportPreset } from "../services/ExportPresets";
 import { exportQueue, type ExportJob } from "../services/ExportQueue";
 import { getWaveform } from "../services/waveform";
@@ -1242,6 +1243,134 @@ const SpeedSection = ({ item }: { item: TrackItem }) => {
   );
 };
 
+// ---------------------------------------------------------------------------
+// Warp stabilizer (#61): analyze camera motion + bake residual keyframes.
+// ---------------------------------------------------------------------------
+
+const StabilizeSection = ({ item }: { item: TrackItem }) => {
+  const project = useTimelineStore((s) => s.project);
+  const updateItem = useTimelineStore((s) => s.updateItem);
+  const [smoothSigma, setSmoothSigma] = useState(20);
+  const [cropToFit, setCropToFit] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [message, setMessage] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  if (item.type !== "clip") return null;
+  const clip = item;
+  const asset = project.assets.find((a) => a.id === clip.assetId);
+  if (!asset || asset.kind === "audio" || !asset.width || !asset.height) return null;
+
+  const run = async () => {
+    setBusy(true);
+    setMessage(null);
+    setProgress(0);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      const result = await analyzeStabilization(
+        asset,
+        clip.sourceInFrame,
+        clip.durationFrames,
+        project.settings.frameRate,
+        (p) => setProgress(Math.round((p.frame / p.totalFrames) * 100)),
+        controller.signal,
+        { smoothSigma, cropToFit },
+      );
+      // Map source-pixel residuals → project-pixel offsets on the clip's
+      // transform (compositor uses canvas-center-relative pixels).
+      const scaleX = project.settings.width / asset.width!;
+      const scaleY = project.settings.height / asset.height!;
+      const positionKfs = result.residuals.map((r) => ({
+        id: createId<KeyframeId>(),
+        frame: r.frame,
+        value: { x: r.dx * scaleX, y: r.dy * scaleY },
+        interpolation: "linear" as const,
+      }));
+      const scaleKf = {
+        id: createId<KeyframeId>(),
+        frame: 0,
+        value: { x: result.recommendedCropScale, y: result.recommendedCropScale },
+        interpolation: "hold" as const,
+      };
+      updateItem(
+        clip.id,
+        (it) => ({
+          ...it,
+          transform: {
+            ...it.transform,
+            position: { kind: "animated", keyframes: positionKfs },
+            ...(cropToFit && result.recommendedCropScale > 1
+              ? { scale: { kind: "animated", keyframes: [scaleKf] } }
+              : {}),
+          },
+        }) as unknown as TrackItem,
+        "stabilize",
+      );
+      setMessage(`Stabilized. Max residual ${result.maxDx.toFixed(0)}×${result.maxDy.toFixed(0)} px, crop ×${result.recommendedCropScale.toFixed(3)}.`);
+    } catch (err) {
+      if ((err as DOMException).name === "AbortError") setMessage("Cancelled.");
+      else setMessage(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusy(false);
+      abortRef.current = null;
+    }
+  };
+
+  return (
+    <Section title="Stabilize (warp)">
+      <p className="mb-1.5 text-[9px] leading-tight text-neutral-600">
+        Tracks a grid of points across the clip and bakes the residual camera motion into position
+        keyframes. Uses translation only in this MVP; add crop-to-fit to hide edge exposure.
+      </p>
+      <SliderRow
+        label="Smoothness (σ frames)"
+        value={smoothSigma}
+        min={5}
+        max={60}
+        step={1}
+        onChange={(v) => setSmoothSigma(Math.max(1, Math.round(v)))}
+      />
+      <label className="mb-2 flex items-center gap-2 text-[10px] text-neutral-400">
+        <input
+          type="checkbox"
+          checked={cropToFit}
+          onChange={(e) => setCropToFit(e.target.checked)}
+          className="accent-(--color-accent)"
+        />
+        Crop to fit (auto-scale up)
+      </label>
+      {busy && (
+        <div className="mb-2">
+          <div className="mb-0.5 flex justify-between text-[10px] text-neutral-500">
+            <span>Analyzing</span>
+            <span className="font-mono">{progress}%</span>
+          </div>
+          <div className="h-1 w-full overflow-hidden rounded bg-panel-raised">
+            <div className="h-full bg-accent transition-[width]" style={{ width: `${progress}%` }} />
+          </div>
+        </div>
+      )}
+      {message && <p className="mb-1.5 text-[10px] text-neutral-500">{message}</p>}
+      {!busy ? (
+        <button
+          onClick={run}
+          className="w-full rounded border border-edge px-2 py-0.5 text-[10px] text-neutral-300 hover:border-accent/60"
+        >
+          Stabilize
+        </button>
+      ) : (
+        <button
+          onClick={() => abortRef.current?.abort()}
+          className="w-full rounded border border-red-500/50 px-2 py-0.5 text-[10px] text-red-300 hover:bg-red-500/10"
+        >
+          Cancel
+        </button>
+      )}
+    </Section>
+  );
+};
+
 /** RGB triple of sliders for one lift/gamma/gain wheel channel. */
 const GradeTriple = ({
   label,
@@ -1682,6 +1811,7 @@ const Inspector = () => {
             <MaskSection item={selectedItem} />
             <TransitionSection item={selectedItem} />
             <SpeedSection item={selectedItem} />
+            <StabilizeSection item={selectedItem} />
             <ColorSection item={selectedItem} updateItem={updateItem} />
             <BlendSection item={selectedItem} updateItem={updateItem} />
 

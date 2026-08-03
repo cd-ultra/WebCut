@@ -54,6 +54,65 @@ const DEFAULTS: Required<TrackOptions> = {
  * Run point tracking on `asset` starting at `startPoint` on frame 0 of the
  * clip's local range. Returns per-frame samples for frames [0, totalFrames).
  */
+export interface FrameGrabber {
+  readonly width: number;
+  readonly height: number;
+  grab(localFrame: number): Promise<Float32Array>;
+  dispose(): void;
+}
+
+/**
+ * Reusable seek-based grayscale frame extractor. The tracker + stabilizer
+ * share this so a video is opened once per operation, not once per point.
+ */
+export const openFrameGrabber = async (
+  asset: MediaAsset,
+  sourceInFrame: number,
+  fps: number,
+): Promise<FrameGrabber> => {
+  const file = await fileSystemService.resolveMediaFile(asset.handleKey);
+  const url = URL.createObjectURL(file);
+  const video = document.createElement("video");
+  video.src = url;
+  video.muted = true;
+  video.playsInline = true;
+  await new Promise<void>((resolve, reject) => {
+    video.addEventListener("loadedmetadata", () => resolve(), { once: true });
+    video.addEventListener("error", () => reject(new Error(`Cannot load ${asset.name}.`)), { once: true });
+  });
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  const canvas = new OffscreenCanvas(w, h);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    URL.revokeObjectURL(url);
+    throw new Error("Failed to get 2D context for frame extraction.");
+  }
+  return {
+    width: w,
+    height: h,
+    async grab(localFrame: number): Promise<Float32Array> {
+      const t = (sourceInFrame + localFrame) / fps;
+      const target = Math.min(Math.max(0, t), Math.max(0, (video.duration || 0) - 1e-3));
+      if (Math.abs(video.currentTime - target) > 1e-3) {
+        video.currentTime = target;
+        await new Promise<void>((resolve) => video.addEventListener("seeked", () => resolve(), { once: true }));
+      }
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(video, 0, 0, w, h);
+      const image = ctx.getImageData(0, 0, w, h).data;
+      const gray = new Float32Array(w * h);
+      for (let i = 0, j = 0; i < image.length; i += 4, j++) {
+        gray[j] = (0.2126 * image[i] + 0.7152 * image[i + 1] + 0.0722 * image[i + 2]) / 255;
+      }
+      return gray;
+    },
+    dispose() {
+      URL.revokeObjectURL(url);
+    },
+  };
+};
+
 export const trackPoint = async (
   asset: MediaAsset,
   sourceInFrame: number,
@@ -65,40 +124,10 @@ export const trackPoint = async (
   options: TrackOptions = {},
 ): Promise<TrackSample[]> => {
   const opts = { ...DEFAULTS, ...options };
-  const file = await fileSystemService.resolveMediaFile(asset.handleKey);
-  const url = URL.createObjectURL(file);
-  const video = document.createElement("video");
-  video.src = url;
-  video.muted = true;
-  video.playsInline = true;
-  await new Promise<void>((resolve, reject) => {
-    video.addEventListener("loadedmetadata", () => resolve(), { once: true });
-    video.addEventListener("error", () => reject(new Error(`Cannot load ${asset.name} for tracking.`)), { once: true });
-  });
-
-  const w = video.videoWidth;
-  const h = video.videoHeight;
-  const canvas = new OffscreenCanvas(w, h);
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx) throw new Error("Failed to get 2D context for tracking.");
-
-  const grabGray = async (localFrame: number): Promise<Float32Array> => {
-    const t = (sourceInFrame + localFrame) / fps;
-    const target = Math.min(Math.max(0, t), Math.max(0, (video.duration || 0) - 1e-3));
-    if (Math.abs(video.currentTime - target) > 1e-3) {
-      video.currentTime = target;
-      await new Promise<void>((resolve) => video.addEventListener("seeked", () => resolve(), { once: true }));
-    }
-    ctx.clearRect(0, 0, w, h);
-    ctx.drawImage(video, 0, 0, w, h);
-    const image = ctx.getImageData(0, 0, w, h).data;
-    const gray = new Float32Array(w * h);
-    for (let i = 0, j = 0; i < image.length; i += 4, j++) {
-      // Rec. 709 luma.
-      gray[j] = (0.2126 * image[i] + 0.7152 * image[i + 1] + 0.0722 * image[i + 2]) / 255;
-    }
-    return gray;
-  };
+  const grabber = await openFrameGrabber(asset, sourceInFrame, fps);
+  const w = grabber.width;
+  const h = grabber.height;
+  const grabGray = grabber.grab.bind(grabber);
 
   try {
     const samples: TrackSample[] = [];
@@ -128,7 +157,7 @@ export const trackPoint = async (
     onProgress({ frame: totalFrames, totalFrames, lost: false });
     return samples;
   } finally {
-    URL.revokeObjectURL(url);
+    grabber.dispose();
   }
 };
 
@@ -136,12 +165,16 @@ export const trackPoint = async (
 // LK core (single-scale + pyramidal wrapper)
 // ---------------------------------------------------------------------------
 
-interface LKResult {
+export interface LKResult {
   readonly x: number;
   readonly y: number;
   readonly confidence: number;
   readonly lost: boolean;
 }
+
+/** Public re-export for the warp stabilizer (#61) — see stabilize.ts. */
+export { DEFAULTS as MOTION_TRACK_DEFAULTS };
+export type { TrackOptions as LKOptions };
 
 /** Sample the gray image with bilinear interpolation at floating (x, y). */
 const bilinear = (img: Float32Array, w: number, h: number, x: number, y: number): number => {
@@ -217,7 +250,7 @@ const lkIter = (
  * then refine at full resolution. Returns the tracked position + a
  * confidence heuristic based on residual magnitude.
  */
-const trackOne = (
+export const trackOne = (
   prev: Float32Array, cur: Float32Array, w: number, h: number,
   seed: TrackPoint, opts: Required<TrackOptions>,
 ): LKResult => {
