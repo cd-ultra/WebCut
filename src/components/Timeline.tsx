@@ -215,29 +215,81 @@ const ClipBlock = ({
 // Track header (mute / solo / lock / hide)
 // ---------------------------------------------------------------------------
 
+const TRACK_COLOR_SWATCHES: readonly string[] = [
+  "#4f8cff", "#5fd0a0", "#e0b65f", "#e07f5f", "#b07fe0", "#e06f9e", "#7ac6ff", "#7ee08a",
+];
+
 const TrackHeader = ({ track }: { track: Track }) => {
   const toggleTrackFlag = useTimelineStore((state) => state.toggleTrackFlag);
   const armedTrackId = useTimelineStore((state) => state.armedTrackId);
   const armTrack = useTimelineStore((state) => state.armTrack);
+  const setTrackColor = useTimelineStore((state) => state.setTrackColor);
+  const setTrackHeight = useTimelineStore((state) => state.setTrackHeight);
+  const [showColorMenu, setShowColorMenu] = useState(false);
   const armed = armedTrackId === track.id;
   const kindBadge = track.kind === "video" ? "V" : track.kind === "audio" ? "A" : "FX";
+
+  const dragging = useRef<{ startY: number; startHeight: number } | null>(null);
+  const onResizeDown = (event: ReactPointerEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    dragging.current = { startY: event.clientY, startHeight: track.heightPx };
+  };
+  const onResizeMove = (event: ReactPointerEvent) => {
+    const d = dragging.current;
+    if (!d) return;
+    setTrackHeight(track.id, d.startHeight + (event.clientY - d.startY));
+  };
+  const onResizeUp = () => { dragging.current = null; };
 
   return (
     <div
       onClick={() => armTrack(track.id)}
       title="Click to target this track for media inserts"
-      className={`flex shrink-0 cursor-pointer items-center gap-1.5 border-b border-edge border-l-2 px-2 ${
+      className={`relative flex shrink-0 cursor-pointer items-center gap-1.5 border-b border-edge border-l-2 px-2 ${
         armed ? "border-l-(--color-accent) bg-panel-raised/70" : "border-l-transparent bg-panel"
       }`}
       style={{ height: track.heightPx, width: HEADER_WIDTH }}
     >
+      {/* Color chip (click to open swatch menu) */}
+      <button
+        title="Track color"
+        onClick={(event) => { event.stopPropagation(); setShowColorMenu((s) => !s); }}
+        className="flex h-5 w-3 items-center justify-center rounded border border-edge"
+        style={{ background: track.color ?? "transparent" }}
+      >
+        {!track.color && <span className="text-[8px] text-neutral-600">◇</span>}
+      </button>
+      {showColorMenu && (
+        <div
+          className="absolute left-2 top-full z-20 mt-1 flex gap-1 rounded border border-edge bg-panel-raised p-1 shadow-lg"
+          onClick={(event) => event.stopPropagation()}
+        >
+          {TRACK_COLOR_SWATCHES.map((c) => (
+            <button
+              key={c}
+              onClick={() => { setTrackColor(track.id, c); setShowColorMenu(false); }}
+              className="h-4 w-4 rounded border border-white/20 hover:scale-110"
+              style={{ background: c }}
+            />
+          ))}
+          <button
+            onClick={() => { setTrackColor(track.id, undefined); setShowColorMenu(false); }}
+            className="h-4 rounded border border-edge px-1 text-[9px] text-neutral-400 hover:border-red-500/60"
+            title="Clear color"
+          >
+            ✕
+          </button>
+        </div>
+      )}
       <span className="flex h-5 w-6 items-center justify-center rounded bg-panel-raised text-[10px] font-bold text-neutral-400">
         {kindBadge}
       </span>
       <span className="min-w-0 flex-1 truncate text-xs text-neutral-300">{track.name}</span>
       <button
         title={track.kind === "audio" ? "Mute" : "Hide"}
-        onClick={() => toggleTrackFlag(track.id, track.kind === "audio" ? "muted" : "hidden")}
+        onClick={(event) => { event.stopPropagation(); toggleTrackFlag(track.id, track.kind === "audio" ? "muted" : "hidden"); }}
         className="rounded p-0.5 text-neutral-500 hover:bg-panel-raised hover:text-neutral-200"
       >
         {track.kind === "audio" ? (
@@ -250,11 +302,19 @@ const TrackHeader = ({ track }: { track: Track }) => {
       </button>
       <button
         title="Lock track"
-        onClick={() => toggleTrackFlag(track.id, "locked")}
+        onClick={(event) => { event.stopPropagation(); toggleTrackFlag(track.id, "locked"); }}
         className="rounded p-0.5 text-neutral-500 hover:bg-panel-raised hover:text-neutral-200"
       >
         {track.locked ? <Lock size={13} /> : <LockOpen size={13} />}
       </button>
+      {/* Resize handle — drag to change track height. */}
+      <div
+        onPointerDown={onResizeDown}
+        onPointerMove={onResizeMove}
+        onPointerUp={onResizeUp}
+        title="Drag to resize track height"
+        className="absolute inset-x-0 bottom-0 h-1 cursor-ns-resize bg-transparent hover:bg-accent/40"
+      />
     </div>
   );
 };
@@ -883,7 +943,10 @@ export const Timeline = () => {
                   className={`relative border-b border-edge/60 bg-panel-deep odd:bg-[#13151a] ${
                     dropTrackId === track.id ? "bg-accent/10 outline outline-1 -outline-offset-1 outline-accent/70" : ""
                   }`}
-                  style={{ height: track.heightPx }}
+                  style={{
+                    height: track.heightPx,
+                    boxShadow: track.color ? `inset 3px 0 0 0 ${track.color}66` : undefined,
+                  }}
                 >
                   {track.items.map((item) => (
                     <ClipBlock

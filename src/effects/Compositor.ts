@@ -30,6 +30,7 @@ import {
   type ColorGrade,
   type CorridorKeyParams,
   type EffectParams,
+  type ShapeMask,
 } from "../types/timeline";
 
 export interface RendererInit {
@@ -59,6 +60,8 @@ export interface LayerState {
   transition: TransitionUniform | null;
   /** Per-frame reduced effect params (b/c/blur/sharpen). */
   effectParams: EffectParams | null;
+  /** Shape mask (#13). */
+  mask: ShapeMask | null;
 }
 
 export class WebGPUCompositor {
@@ -112,6 +115,7 @@ export class WebGPUCompositor {
         lut3dSize: 2,
         transition: null,
         effectParams: null,
+        mask: null,
       };
       this.layers.set(layerId, layer);
     }
@@ -129,6 +133,12 @@ export class WebGPUCompositor {
     if (this.destroyed) return;
     const layer = this.ensureLayer(layerId, this.layers.get(layerId)?.order ?? 0);
     layer.effectParams = params;
+  }
+
+  setLayerMask(layerId: string, mask: ShapeMask | null): void {
+    if (this.destroyed) return;
+    const layer = this.ensureLayer(layerId, this.layers.get(layerId)?.order ?? 0);
+    layer.mask = mask;
   }
 
   setLayerBlend(layerId: string, mode: BlendMode): void {
@@ -265,6 +275,7 @@ export class WebGPUCompositor {
           layer.lut3dSize,
           layer.transition,
           layer.effectParams,
+          layer.mask,
         ),
       );
     }

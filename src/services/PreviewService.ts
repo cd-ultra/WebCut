@@ -53,6 +53,7 @@ export interface FrameSink {
   setLayerGrade(layerId: string, grade: ColorGrade | null): void;
   setLayerTransition(layerId: string, transition: import("../effects/CorridorKeyShader").TransitionUniform | null): void;
   setLayerEffectParams(layerId: string, params: import("../types/timeline").EffectParams | null): void;
+  setLayerMask(layerId: string, mask: import("../types/timeline").ShapeMask | null): void;
   /** Reconcile live layers; anything absent from the list is destroyed. */
   syncLayers(activeLayerIds: readonly string[]): void;
 }
@@ -334,6 +335,7 @@ class PreviewService {
       sink.setLayerGrade(layerId, clip.grade ?? null);
       sink.setLayerTransition(layerId, transition);
       sink.setLayerEffectParams(layerId, reduceEffects(clip.effects, frame - clip.startFrame));
+      sink.setLayerMask(layerId, clip.mask ?? null);
 
       if (asset.kind === "image") {
         const bitmap = await this.getImageBitmap(asset);

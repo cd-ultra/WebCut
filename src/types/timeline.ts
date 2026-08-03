@@ -408,6 +408,37 @@ export interface Transition {
   readonly frames: number;
 }
 
+/**
+ * Shape mask (#13). Points are in NORMALIZED clip-frame coords: (0,0) is the
+ * top-left of the source frame, (1,1) is the bottom-right. Rectangles/ellipses
+ * use exactly two points (opposing corners of the axis-aligned bounding box).
+ * Polygons use N points (max ~32) evaluated in the shader via winding number.
+ */
+export type MaskShape = "rect" | "ellipse" | "polygon";
+
+export interface ShapeMask {
+  readonly shape: MaskShape;
+  readonly points: readonly Vec2[];
+  /** Invert the mask (keep everything OUTSIDE the shape). */
+  readonly inverted: boolean;
+  /** Soft edge, in normalized units (0..0.2 typical). */
+  readonly feather: number;
+}
+
+export const identityRectMask = (): ShapeMask => ({
+  shape: "rect",
+  points: [{ x: 0.1, y: 0.1 }, { x: 0.9, y: 0.9 }],
+  inverted: false,
+  feather: 0.02,
+});
+
+export const identityEllipseMask = (): ShapeMask => ({
+  shape: "ellipse",
+  points: [{ x: 0.1, y: 0.1 }, { x: 0.9, y: 0.9 }],
+  inverted: false,
+  feather: 0.02,
+});
+
 export interface ClipItem extends TrackItemBase {
   readonly type: "clip";
   readonly assetId: MediaAssetId;
@@ -434,6 +465,8 @@ export interface ClipItem extends TrackItemBase {
   readonly audioMuted: boolean;
   /** Primary color grade; absent ⇒ identity (no correction). */
   readonly grade?: ColorGrade;
+  /** Shape mask (#13). Absent ⇒ no mask. */
+  readonly mask?: ShapeMask;
 }
 
 export interface ShapeItem extends TrackItemBase {
