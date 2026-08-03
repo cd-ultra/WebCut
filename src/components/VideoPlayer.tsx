@@ -27,6 +27,8 @@ import { transport, useTimelineStore } from "../store/timelineStore";
 import {
   sampleAnimatable,
   staticValue,
+  type ClipItem,
+  type ShapeMask,
   type TrackItem,
   type TrackItemId,
   type Transform,
@@ -176,6 +178,17 @@ export const VideoPlayer = () => {
     return undefined;
   }, [selectedItemIds, tracks]);
 
+  // Shape-mask gizmo target: a selected clip that has a mask (#13).
+  const selectedMaskedClip = useMemo(() => {
+    if (selectedItemIds.length !== 1) return undefined;
+    for (const track of tracks) {
+      const found = track.items.find((item) => item.id === selectedItemIds[0]);
+      if (found && found.type === "clip" && found.mask) return found;
+    }
+    return undefined;
+  }, [selectedItemIds, tracks]);
+  const setClipMask = useTimelineStore((state) => state.setClipMask);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -318,6 +331,10 @@ export const VideoPlayer = () => {
           settings={settings}
           updateItem={updateItem}
         />
+      )}
+
+      {selectedMaskedClip && canvasBox && (
+        <MaskGizmo item={selectedMaskedClip} box={canvasBox} setClipMask={setClipMask} />
       )}
 
       {/* Preview controls */}
@@ -513,5 +530,119 @@ const FpsBadge = () => {
     <span className="absolute right-3 top-2 z-30 rounded bg-black/60 px-2 py-0.5 font-mono text-[10px] text-accent">
       {stats.fps} fps · {stats.ms} ms
     </span>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// MaskGizmo (#13): on-canvas draggable handles for the current clip's mask.
+// Rect/ellipse: two opposing corners. Polygon: every vertex + click-to-add.
+// ---------------------------------------------------------------------------
+
+const MaskGizmo = ({
+  item,
+  box,
+  setClipMask,
+}: {
+  item: ClipItem;
+  box: { left: number; top: number; width: number; height: number };
+  setClipMask: (itemId: TrackItemId, mask: ShapeMask | null) => void;
+}) => {
+  const mask = item.mask;
+  if (!mask) return null;
+  const dragging = useRef<number | null>(null);
+
+  const toNormalized = (event: React.PointerEvent): { x: number; y: number } => ({
+    x: Math.max(0, Math.min(1, (event.clientX - box.left) / box.width)),
+    y: Math.max(0, Math.min(1, (event.clientY - box.top) / box.height)),
+  });
+
+  const commit = (points: readonly { x: number; y: number }[]) => {
+    setClipMask(item.id, { ...mask, points });
+  };
+
+  const onHandleDown = (idx: number) => (event: React.PointerEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    dragging.current = idx;
+  };
+
+  const onMove = (event: React.PointerEvent) => {
+    if (dragging.current === null) return;
+    const p = toNormalized(event);
+    const next = mask.points.map((pt, i) => (i === dragging.current ? p : pt));
+    commit(next);
+  };
+
+  const onUp = () => { dragging.current = null; };
+
+  const onSurfaceClick = (event: React.PointerEvent) => {
+    // Polygon: click on empty area adds a vertex (respecting the 16 cap).
+    if (mask.shape !== "polygon") return;
+    if (mask.points.length >= 16) return;
+    const p = toNormalized(event);
+    commit([...mask.points, p]);
+  };
+
+  const px = (n: number, size: number, origin: number): number => origin + n * size;
+  // Rect/ellipse outline rendered as a border-only overlay.
+  const rectOutline = () => {
+    if (mask.shape !== "rect" && mask.shape !== "ellipse") return null;
+    const [a, b] = mask.points;
+    const left = px(Math.min(a.x, b.x), box.width, box.left);
+    const top = px(Math.min(a.y, b.y), box.height, box.top);
+    const width = Math.abs(b.x - a.x) * box.width;
+    const height = Math.abs(b.y - a.y) * box.height;
+    return (
+      <div
+        className={`pointer-events-none absolute border border-dashed border-accent/90 ${mask.shape === "ellipse" ? "rounded-full" : ""}`}
+        style={{ left, top, width, height }}
+      />
+    );
+  };
+
+  return (
+    <div
+      className="pointer-events-auto absolute inset-0 z-30"
+      onPointerMove={onMove}
+      onPointerUp={onUp}
+      onPointerDown={onSurfaceClick}
+    >
+      {rectOutline()}
+      {/* Polygon edges */}
+      {mask.shape === "polygon" && mask.points.length >= 2 && (
+        <svg
+          className="pointer-events-none absolute inset-0"
+          viewBox={`${box.left} ${box.top} ${box.width} ${box.height}`}
+          preserveAspectRatio="none"
+          style={{ left: 0, top: 0, width: "100%", height: "100%" }}
+        >
+          <polygon
+            points={mask.points.map((p) => `${px(p.x, box.width, box.left)},${px(p.y, box.height, box.top)}`).join(" ")}
+            fill="none"
+            stroke="rgb(120,180,255)"
+            strokeWidth="1.5"
+            strokeDasharray="4 3"
+            vectorEffect="non-scaling-stroke"
+          />
+        </svg>
+      )}
+      {/* Vertex / corner handles */}
+      {mask.points.map((p, i) => (
+        <button
+          key={i}
+          onPointerDown={onHandleDown(i)}
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            if (mask.shape === "polygon" && mask.points.length > 3) {
+              commit(mask.points.filter((_, idx) => idx !== i));
+            }
+          }}
+          className="absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 cursor-move rounded-full border border-white bg-accent"
+          style={{ left: px(p.x, box.width, box.left), top: px(p.y, box.height, box.top) }}
+          title={mask.shape === "polygon" ? "Drag to move; double-click to remove" : "Drag to reshape"}
+        />
+      ))}
+    </div>
   );
 };

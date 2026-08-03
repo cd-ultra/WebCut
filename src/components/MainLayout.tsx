@@ -64,7 +64,9 @@ import {
   sampleAnimatable,
   staticValue,
   identityCurves,
+  identityEllipseMask,
   identityHsl,
+  identityRectMask,
   isIdentityCurves,
   type CurvePoint,
   type GradeCurves,
@@ -84,6 +86,7 @@ import {
   type MediaAssetId,
   type MediaKind,
   type AnimatableValue,
+  type MaskShape,
   type ShapeItem,
   type TextItem,
   type Track,
@@ -1018,6 +1021,90 @@ const EffectsSection = ({ item }: { item: TrackItem }) => {
 };
 
 // ---------------------------------------------------------------------------
+// Shape mask (#13)
+// ---------------------------------------------------------------------------
+
+const MaskSection = ({ item }: { item: TrackItem }) => {
+  const setClipMask = useTimelineStore((s) => s.setClipMask);
+  if (item.type !== "clip") return null;
+  const clip = item;
+  const mask = clip.mask ?? null;
+
+  const setKind = (kind: MaskShape | null) => {
+    if (kind === null) return setClipMask(clip.id, null);
+    if (kind === "polygon") {
+      // Sensible starter polygon: a diamond in the center.
+      setClipMask(clip.id, {
+        shape: "polygon",
+        points: [
+          { x: 0.5, y: 0.15 }, { x: 0.85, y: 0.5 }, { x: 0.5, y: 0.85 }, { x: 0.15, y: 0.5 },
+        ],
+        inverted: mask?.inverted ?? false,
+        feather: mask?.feather ?? 0.02,
+      });
+      return;
+    }
+    setClipMask(clip.id, kind === "rect" ? identityRectMask() : identityEllipseMask());
+  };
+
+  return (
+    <Section title="Shape mask">
+      <div className="mb-1.5 flex flex-wrap gap-1">
+        {(["rect", "ellipse", "polygon"] as const).map((k) => (
+          <button
+            key={k}
+            onClick={() => setKind(k)}
+            className={`rounded px-1.5 py-0.5 text-[9px] capitalize ${mask?.shape === k ? "bg-accent/30 text-accent" : "border border-edge text-neutral-400 hover:border-accent/60"}`}
+          >
+            {k}
+          </button>
+        ))}
+        {mask && (
+          <button
+            onClick={() => setKind(null)}
+            className="ml-auto rounded border border-edge px-1.5 py-0.5 text-[9px] text-neutral-500 hover:border-red-500/60"
+          >
+            Remove
+          </button>
+        )}
+      </div>
+      {mask && (
+        <>
+          <label className="mb-1 flex items-center gap-2 text-[10px] text-neutral-400">
+            <input
+              type="checkbox"
+              checked={mask.inverted}
+              onChange={(e) => setClipMask(clip.id, { ...mask, inverted: e.target.checked })}
+              className="accent-(--color-accent)"
+            />
+            Invert (keep OUTSIDE the shape)
+          </label>
+          <SliderRow
+            label="Feather"
+            value={mask.feather}
+            min={0}
+            max={0.2}
+            step={0.005}
+            onChange={(v) => setClipMask(clip.id, { ...mask, feather: Math.max(0, Math.min(0.2, v)) })}
+          />
+          {mask.shape !== "polygon" && (
+            <p className="mt-1 text-[9px] text-neutral-600">
+              Corners: ({mask.points[0].x.toFixed(2)}, {mask.points[0].y.toFixed(2)}) → ({mask.points[1].x.toFixed(2)}, {mask.points[1].y.toFixed(2)}).
+              Drag on the preview to reshape (coming with the on-canvas gizmo).
+            </p>
+          )}
+          {mask.shape === "polygon" && (
+            <p className="mt-1 text-[9px] text-neutral-600">
+              {mask.points.length} vertices. Max 16 in this MVP; click on the preview to add/move.
+            </p>
+          )}
+        </>
+      )}
+    </Section>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Transitions (#6): crossfade / dissolve / wipe applied at a clip's edge
 // ---------------------------------------------------------------------------
 
@@ -1569,6 +1656,7 @@ const Inspector = () => {
             <ShapeSection item={selectedItem} updateItem={updateItem} />
             <ClipSection item={selectedItem} updateItem={updateItem} />
             <EffectsSection item={selectedItem} />
+            <MaskSection item={selectedItem} />
             <TransitionSection item={selectedItem} />
             <SpeedSection item={selectedItem} />
             <ColorSection item={selectedItem} updateItem={updateItem} />

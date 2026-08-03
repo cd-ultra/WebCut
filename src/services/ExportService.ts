@@ -250,6 +250,7 @@ export const exportProject = async (
         compositor.setLayerGrade(layerId, clip.grade ?? null);
         compositor.setLayerTransition(layerId, transition);
         compositor.setLayerEffectParams(layerId, reduceEffects(clip.effects, f - clip.startFrame));
+        compositor.setLayerMask(layerId, clip.mask ?? null);
         activeIds.push(layerId);
         if (asset.kind === "image") {
           const bmp = await getImage(asset);

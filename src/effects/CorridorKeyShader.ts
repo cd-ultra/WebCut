@@ -25,6 +25,7 @@ import {
   type ColorGrade,
   type CorridorKeyParams,
   type EffectParams,
+  type ShapeMask,
 } from "../types/timeline";
 import { identityCurveLut, identityLut3D } from "./lut";
 
@@ -59,6 +60,21 @@ struct CorridorKeyUniforms {
   transition : vec4<f32>,
   // x = brightness delta, y = contrast multiplier, z = blur radius (px), w = sharpen amount
   effect_params : vec4<f32>,
+  // x = mask kind (0=none/1=rect/2=ellipse/3=polygon), y = inverted (0/1),
+  // z = feather (normalized), w = polygon vertex count (0..16)
+  mask_params : vec4<f32>,
+  // Rect/ellipse: xy = min corner, zw = max corner (normalized).
+  // Polygon: unused (see polygon_pts below).
+  mask_rect : vec4<f32>,
+  // Up to 16 polygon vertices packed as 4 vec4 (xy, zw pairs).
+  polygon_pts0 : vec4<f32>,
+  polygon_pts1 : vec4<f32>,
+  polygon_pts2 : vec4<f32>,
+  polygon_pts3 : vec4<f32>,
+  polygon_pts4 : vec4<f32>,
+  polygon_pts5 : vec4<f32>,
+  polygon_pts6 : vec4<f32>,
+  polygon_pts7 : vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> u : CorridorKeyUniforms;
@@ -294,6 +310,86 @@ struct FragmentInput {
 };
 
 @fragment
+// Get one polygon vertex (up to 16) from the packed uniform array.
+fn polygon_point(idx : u32) -> vec2<f32> {
+  // Two vec2 vertices per vec4, so 8 vec4 = 16 vertices.
+  let group = idx / 2u;
+  let half = idx % 2u;
+  var v : vec4<f32>;
+  if (group == 0u) { v = u.polygon_pts0; }
+  else if (group == 1u) { v = u.polygon_pts1; }
+  else if (group == 2u) { v = u.polygon_pts2; }
+  else if (group == 3u) { v = u.polygon_pts3; }
+  else if (group == 4u) { v = u.polygon_pts4; }
+  else if (group == 5u) { v = u.polygon_pts5; }
+  else if (group == 6u) { v = u.polygon_pts6; }
+  else { v = u.polygon_pts7; }
+  if (half == 0u) { return v.xy; }
+  return v.zw;
+}
+
+// Point-in-polygon by winding number (crossing count). Returns 1 inside, 0 outside.
+fn point_in_polygon(pt : vec2<f32>, count : u32) -> f32 {
+  var inside = false;
+  if (count < 3u) { return 0.0; }
+  var prev = polygon_point(count - 1u);
+  for (var i = 0u; i < 16u; i = i + 1u) {
+    if (i >= count) { break; }
+    let cur = polygon_point(i);
+    // Ray-cast: does the horizontal ray from pt cross edge (prev, cur)?
+    let cond1 = (cur.y > pt.y) != (prev.y > pt.y);
+    let denom = prev.y - cur.y;
+    if (cond1 && denom != 0.0) {
+      let xIntersect = cur.x + (pt.y - cur.y) * (prev.x - cur.x) / denom;
+      if (pt.x < xIntersect) { inside = !inside; }
+    }
+    prev = cur;
+  }
+  if (inside) { return 1.0; }
+  return 0.0;
+}
+
+// Mask alpha at uv ∈ [0,1]². Returns 1 = fully visible, 0 = fully hidden.
+fn shape_mask_alpha(uv : vec2<f32>) -> f32 {
+  let kind = u.mask_params.x;
+  if (kind < 0.5) { return 1.0; }
+  let feather = max(u.mask_params.z, 1e-4);
+  var inside = 0.0;
+  if (kind < 1.5) {
+    // Rectangle — signed distance from the axis-aligned rect edges.
+    let mn = u.mask_rect.xy;
+    let mx = u.mask_rect.zw;
+    let d = min(min(uv.x - mn.x, mx.x - uv.x), min(uv.y - mn.y, mx.y - uv.y));
+    inside = smoothstep(-feather, feather, d);
+  } else if (kind < 2.5) {
+    // Ellipse — normalized distance from center in the rect's aspect.
+    let mn = u.mask_rect.xy;
+    let mx = u.mask_rect.zw;
+    let c = (mn + mx) * 0.5;
+    let r = (mx - mn) * 0.5;
+    let n = (uv - c) / max(r, vec2<f32>(1e-4));
+    let d = 1.0 - length(n); // >0 inside
+    inside = smoothstep(-feather, feather, d);
+  } else {
+    // Polygon — binary from winding then feather across a signed distance-ish
+    // approximation via jittered samples.
+    let count = u32(u.mask_params.w);
+    let core = point_in_polygon(uv, count);
+    // Cheap edge softening: sample four neighbors at the feather radius and
+    // blend. This is not a true SDF but reads acceptably for small feathers.
+    let f = feather;
+    let s1 = point_in_polygon(uv + vec2<f32>( f,  0.0), count);
+    let s2 = point_in_polygon(uv + vec2<f32>(-f,  0.0), count);
+    let s3 = point_in_polygon(uv + vec2<f32>( 0.0,  f), count);
+    let s4 = point_in_polygon(uv + vec2<f32>( 0.0, -f), count);
+    inside = (core + s1 + s2 + s3 + s4) * 0.2;
+  }
+  if (u.mask_params.y > 0.5) {
+    inside = 1.0 - inside;
+  }
+  return clamp(inside, 0.0, 1.0);
+}
+
 // 9-tap Gaussian blur / unsharp-mask sample of source_tex. When both blur and
 // sharpen are inactive this collapses to a single-tap read.
 fn effect_sample_source(uv : vec2<f32>) -> vec3<f32> {
@@ -386,9 +482,12 @@ fn fs_corridor_key(input : FragmentInput) -> @location(0) vec4<f32> {
     t_alpha = t_alpha * edge;
   }
 
-  let final_alpha = matte * src.a * t_alpha;
+  // Shape mask (#13) — multiplies the final alpha.
+  let mask = shape_mask_alpha(input.uv);
+
+  let final_alpha = matte * src.a * t_alpha * mask;
   // Premultiplied alpha out — required for correct compositor blending.
-  return vec4<f32>(graded * matte * t_alpha, final_alpha);
+  return vec4<f32>(graded * matte * t_alpha * mask, final_alpha);
 }
 `;
 
@@ -415,8 +514,8 @@ fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VertexOutput {
 // Uniform packing
 // ---------------------------------------------------------------------------
 
-/** Bytes in the CorridorKeyUniforms block (12 x vec4<f32>). */
-export const CORRIDOR_KEY_UNIFORM_SIZE = 192;
+/** Bytes in the CorridorKeyUniforms block (22 x vec4<f32>). */
+export const CORRIDOR_KEY_UNIFORM_SIZE = 352;
 
 /**
  * Pack params into a Float32Array laid out exactly as the WGSL uniform struct.
@@ -442,6 +541,7 @@ export const packCorridorKeyUniforms = (
   lut3dSize?: number,
   transition?: TransitionUniform | null,
   effects?: EffectParams | null,
+  mask?: ShapeMask | null,
 ): Float32Array => {
   const data = new Float32Array(CORRIDOR_KEY_UNIFORM_SIZE / 4);
   data[0] = params.keyColor[0];
@@ -512,6 +612,39 @@ export const packCorridorKeyUniforms = (
   data[45] = effects?.contrastMul ?? 1;
   data[46] = effects?.blurRadiusPx ?? 0;
   data[47] = effects?.sharpenAmount ?? 0;
+
+  // mask_params (kind, inverted, feather, poly-point-count). Identity is (0,...).
+  const MASK_KIND: Record<ShapeMask["shape"], number> = { rect: 1, ellipse: 2, polygon: 3 };
+  const m = mask ?? null;
+  const kind = m ? MASK_KIND[m.shape] : 0;
+  data[48] = kind;
+  data[49] = m?.inverted ? 1 : 0;
+  data[50] = m?.feather ?? 0;
+  data[51] = m && m.shape === "polygon" ? Math.min(16, m.points.length) : 0;
+  // mask_rect: min corner, max corner. For a polygon this is the bbox (unused
+  // by the shader but computed anyway for potential future use).
+  let minX = 0, minY = 0, maxX = 1, maxY = 1;
+  if (m && (m.shape === "rect" || m.shape === "ellipse") && m.points.length >= 2) {
+    minX = Math.min(m.points[0].x, m.points[1].x);
+    minY = Math.min(m.points[0].y, m.points[1].y);
+    maxX = Math.max(m.points[0].x, m.points[1].x);
+    maxY = Math.max(m.points[0].y, m.points[1].y);
+  }
+  data[52] = minX;
+  data[53] = minY;
+  data[54] = maxX;
+  data[55] = maxY;
+  // Polygon points, up to 16 packed as 8 vec4 (2 vertices per vec4).
+  for (let i = 0; i < 16; i++) {
+    const base = 56 + i * 2;
+    if (m && m.shape === "polygon" && i < m.points.length) {
+      data[base] = m.points[i].x;
+      data[base + 1] = m.points[i].y;
+    } else {
+      data[base] = 0;
+      data[base + 1] = 0;
+    }
+  }
   return data;
 };
 
