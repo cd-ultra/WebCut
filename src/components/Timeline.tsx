@@ -39,6 +39,7 @@ import {
 import { ASSET_DND_MIME, ingestFiles } from "../services/mediaImport";
 import { getWaveform } from "../services/waveform";
 import {
+  expandLinked,
   transport,
   useTimelineStore,
   useTransportFrame,
@@ -415,6 +416,9 @@ export const Timeline = () => {
   const setSelection = useTimelineStore((state) => state.setSelection);
   const removeItems = useTimelineStore((state) => state.removeItems);
   const rippleDelete = useTimelineStore((state) => state.rippleDelete);
+  const detachAudioFromClip = useTimelineStore((state) => state.detachAudioFromClip);
+  const linkItems = useTimelineStore((state) => state.linkItems);
+  const unlinkItems = useTimelineStore((state) => state.unlinkItems);
   const addTrack = useTimelineStore((state) => state.addTrack);
   const addClipToTrack = useTimelineStore((state) => state.addClipToTrack);
   const addAsset = useTimelineStore((state) => state.addAsset);
@@ -503,15 +507,47 @@ export const Timeline = () => {
 
   // -- Clip drag / trim / razor ----------------------------------------------
 
+  /**
+   * Ids to select when the user picks `itemId`: the whole link group, or just
+   * the one item when Alt is held (#99). Alt is how you get at the audio half
+   * of a detached pair on its own — to mute, trim or delete only it.
+   */
+  const selectLinkAware = useCallback((itemId: TrackItemId, alone: boolean): TrackItemId[] => {
+    if (alone) return [itemId];
+    return [...expandLinked(useTimelineStore.getState().project, [itemId])];
+  }, []);
+
+  /**
+   * What a Delete from the context menu should remove: the current selection
+   * when the clicked item is part of it (so a linked pair goes together, or
+   * just one half after an Alt-click), otherwise only the clicked item.
+   */
+  const deleteTargets = useCallback(
+    (itemId: TrackItemId): TrackItemId[] => {
+      const selection = useTimelineStore.getState().selectedItemIds;
+      return selection.includes(itemId) ? [...selection] : [itemId];
+    },
+    [],
+  );
+
+  // Whether the right-clicked item is a video clip whose audio can still be
+  // split off (#99) — narrowed here so the menu entries stay declarative.
+  const menuItem = menu?.item;
+  const menuClipHasAudio =
+    !!menuItem &&
+    menuItem.type === "clip" &&
+    !menuItem.linkGroupId &&
+    assets.find((asset) => asset.id === menuItem.assetId)?.kind === "video";
+
   const openMenu = useCallback(
     (event: ReactMouseEvent, item: TrackItem) => {
       event.preventDefault();
       event.stopPropagation();
       const selection = useTimelineStore.getState().selectedItemIds;
-      if (!selection.includes(item.id)) setSelection([item.id]);
+      if (!selection.includes(item.id)) setSelection(selectLinkAware(item.id, event.altKey));
       setMenu({ x: event.clientX, y: event.clientY, item });
     },
-    [setSelection],
+    [setSelection, selectLinkAware],
   );
 
   useEffect(() => {
@@ -538,7 +574,9 @@ export const Timeline = () => {
     }
 
     (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-    setSelection([item.id]);
+    // Linked A/V (#99) selects as one object; Alt targets a single half, which
+    // also matches Alt+drag already meaning "slide just this item".
+    setSelection(selectLinkAware(item.id, event.altKey));
     dragRef.current = {
       mode,
       itemId: item.id,
@@ -1028,8 +1066,19 @@ export const Timeline = () => {
                 useTimelineStore.getState().cutSelection();
               },
             },
-            { label: "Delete", run: () => removeItems([menu.item.id]) },
-            { label: "Ripple delete", run: () => rippleDelete([menu.item.id]) },
+            // Detach/link operate on the A/V pairing (#99). "Detach audio" only
+            // appears for a video-backed clip — audio clips are already detached.
+            ...(menuClipHasAudio ? [{ label: "Detach audio", run: () => detachAudioFromClip(menu.item.id) }] : []),
+            ...(menu.item.linkGroupId
+              ? [{ label: "Unlink audio/video", run: () => unlinkItems([menu.item.id]) }]
+              : []),
+            ...(selectedItemIds.length > 1 && !menu.item.linkGroupId
+              ? [{ label: "Link selected", run: () => linkItems(selectedItemIds) }]
+              : []),
+            // Deleting follows the highlighted selection, which is the whole
+            // link group unless the user Alt-clicked a single half.
+            { label: "Delete", run: () => removeItems(deleteTargets(menu.item.id)) },
+            { label: "Ripple delete", run: () => rippleDelete(deleteTargets(menu.item.id)) },
           ].map((entry) => (
             <button
               key={entry.label}

@@ -21,6 +21,7 @@
 import { ArrayBufferTarget as Mp4Target, Muxer as Mp4Muxer } from "mp4-muxer";
 import { ArrayBufferTarget as WebmTarget, Muxer as WebmMuxer } from "webm-muxer";
 import { WebGPUCompositor } from "../effects/Compositor";
+import { audibleTrackIds } from "./audioRouting";
 import { projectChaptersToWebVtt } from "./chapters";
 import { setExpressionFps } from "../expression";
 import { fileSystemService } from "./FileSystemService";
@@ -396,8 +397,12 @@ const mixAndEncodeAudio = async (
   const length = Math.max(1, Math.ceil(durationSec * sampleRate));
   const ctx = new OfflineAudioContext({ numberOfChannels: 2, length, sampleRate });
 
+  // Mute/solo comes from the shared rule so the render matches what preview
+  // played back (see services/audioRouting.ts).
+  const audible = audibleTrackIds(project);
+
   for (const track of project.tracks) {
-    if (track.muted) continue;
+    if (!audible.has(track.id)) continue;
     const trackGain = track.gainDb ?? 0;
     const pan = track.pan ?? 0;
     for (const item of track.items) {

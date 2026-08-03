@@ -418,6 +418,14 @@ interface TrackItemBase {
   readonly locked: boolean;
   /** Compositing blend mode; absent ⇒ "normal". */
   readonly blendMode?: BlendMode;
+  /**
+   * Linked A/V group (#99). Items sharing a `linkGroupId` move, trim and split
+   * together, and selecting one selects the rest — the pairing produced by
+   * "Detach audio". Per-clip properties (notably `audioMuted`) are NOT linked,
+   * so the audio half can be silenced or adjusted on its own. Absent ⇒ the
+   * item is independent.
+   */
+  readonly linkGroupId?: string;
 }
 
 /**

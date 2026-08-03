@@ -37,6 +37,7 @@ import {
 } from "lucide-react";
 import { VideoPlayer } from "./VideoPlayer";
 import { Timeline } from "./Timeline";
+import { audioGraph } from "../services/AudioGraph";
 import { fileSystemService, isUserAbort } from "../services/FileSystemService";
 import {
   ASSET_DND_MIME,
@@ -2499,7 +2500,18 @@ const useMixerLevels = (): Record<string, number> => {
     const loop = () => {
       const frame = transport.getFrame();
       const next: Record<string, number> = {};
+      const playing = transport.isPlaying();
       for (const track of tracks) {
+        // During playback the mixer graph is the real signal, so meter what is
+        // actually being heard (post gain/pan/solo). Paused, fall back to the
+        // waveform under the playhead so the meters still show something.
+        if (playing) {
+          const measured = audioGraph.peakLevel(track.id);
+          if (measured > 0) {
+            next[track.id] = measured;
+            continue;
+          }
+        }
         const clip = track.items.find(
           (i) => i.type === "clip" && frame >= i.startFrame && frame < i.startFrame + i.durationFrames,
         ) as ClipItem | undefined;
@@ -2690,9 +2702,10 @@ const MixerPanel = ({ onClose }: { onClose: () => void }) => {
       </div>
       <p className="mt-2 min-h-[14px] text-[10px] text-accent">{status}</p>
       <p className="mt-1 text-[10px] leading-relaxed text-neutral-600">
-        Faders/mute/solo affect playback live. VU meters read the waveform under the playhead. Normalize
-        measures integrated LUFS (ITU-R BS.1770); “Duck under” writes gain automation. Pan is stored per
-        track (stereo panning applies once a Web Audio graph is added).
+        Faders, pan, mute and solo affect playback live through the Web Audio mixer and are applied
+        identically on export. VU meters read the live mix while playing, and the waveform under the
+        playhead while paused. Normalize measures integrated LUFS (ITU-R BS.1770); “Duck under” writes
+        gain automation.
       </p>
     </Modal>
   );

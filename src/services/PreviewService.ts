@@ -11,8 +11,16 @@
  *  - Scrub/paused: seek the element to the mapped media time; push on `seeked`.
  *  - Playing: play() the element at clip speed; requestVideoFrameCallback
  *    pushes each presented frame and drift-corrects against the transport.
+ *
+ * Audio (#100): clips on audio tracks have no visual layer, so they're resolved
+ * separately by `resolveActiveAudioClips` and driven through hidden <audio>
+ * elements with the same seek/drift/play logic. Every element — video and audio
+ * alike — is routed through the shared `audioGraph` mixer so track gain, pan,
+ * mute and solo apply uniformly and match the export mixdown.
  */
 
+import { audioGraph } from "./AudioGraph";
+import { audibleTrackIds } from "./audioRouting";
 import { fileSystemService } from "./FileSystemService";
 import { getUseProxies } from "./ProxyService";
 import { getWaveform } from "./waveform";
@@ -42,6 +50,7 @@ import {
   type StickerItem,
   type SubtitleStyle,
   type TextItem,
+  type TrackId,
   type Vec2,
 } from "../types/timeline";
 
@@ -70,11 +79,12 @@ type RVFCVideo = HTMLVideoElement & {
 };
 
 const EMPTY_VIDEO_SET: ReadonlySet<RVFCVideo> = new Set();
+const EMPTY_AUDIO_SET: ReadonlySet<HTMLAudioElement> = new Set();
 
 export interface ActiveLayerClip {
   readonly clip: ClipItem;
   readonly asset: MediaAsset;
-  readonly trackId: string;
+  readonly trackId: TrackId;
   /** Per-active-clip layer id; distinct from `trackId` so two clips can co-exist during a transition. */
   readonly layerId: string;
   readonly trackMuted: boolean;
@@ -216,6 +226,57 @@ export const resolveActiveOverlays = (project: Project, frame: number): ActiveOv
 /** Linear gain [0,1] from a dB value, clamped to what an <audio> element allows. */
 export const dbToVolume = (gainDb: number): number => Math.min(1, Math.max(0, Math.pow(10, gainDb / 20)));
 
+/** A clip whose audio is driven by a dedicated element rather than a video layer. */
+export interface ActiveAudioClip {
+  readonly clip: ClipItem;
+  readonly asset: MediaAsset;
+  readonly trackId: TrackId;
+  /** Cache key for the backing <audio> element (per clip, so overlaps work). */
+  readonly elementKey: string;
+  readonly trackGainDb: number;
+}
+
+/**
+ * Clips under the playhead whose audio must come from a dedicated <audio>
+ * element (#100).
+ *
+ * A clip belongs to this path when it sits on an audio track OR its asset is
+ * audio-only. Clips on video tracks backed by video assets are excluded: their
+ * audio already comes from the <video> element the compositor is using, and
+ * driving a second element would double the sound.
+ *
+ * That partition is also what makes detached audio (#99) correct — the
+ * detached copy lives on an audio track (this path) while its source clip
+ * carries `audioMuted`, so exactly one element produces sound.
+ *
+ * Muted/un-soloed tracks are still returned so their elements stay in sync and
+ * resume instantly when unmuted; audibility is applied as gain by the caller.
+ */
+export const resolveActiveAudioClips = (project: Project, frame: number): ActiveAudioClip[] => {
+  const wholeFrame = Math.floor(frame);
+  const out: ActiveAudioClip[] = [];
+  for (const track of project.tracks) {
+    for (const item of track.items) {
+      if (item.type !== "clip") continue;
+      if (wholeFrame < item.startFrame || wholeFrame >= item.startFrame + item.durationFrames) continue;
+      const asset = project.assets.find((candidate) => candidate.id === item.assetId);
+      if (!asset) continue;
+      // Sequences carry no directly-decodable audio track of their own.
+      if (asset.kind === "image" || asset.kind === "sequence") continue;
+      const ownedByAudioPath = track.kind === "audio" || asset.kind === "audio";
+      if (!ownedByAudioPath) continue;
+      out.push({
+        clip: item,
+        asset,
+        trackId: track.id,
+        elementKey: `audio:${item.id}:${asset.handleKey}`,
+        trackGainDb: track.gainDb ?? 0,
+      });
+    }
+  }
+  return out;
+};
+
 export const corridorKeyOf = (clip: ClipItem): { enabled: boolean; params: CorridorKeyParams } => {
   const effect = clip.effects.find((candidate) => candidate.type === "corridor-key");
   if (effect && effect.type === "corridor-key") {
@@ -227,6 +288,10 @@ export const corridorKeyOf = (clip: ClipItem): { enabled: boolean; params: Corri
 class PreviewService {
   private sink: FrameSink | null = null;
   private videoElements = new Map<string, RVFCVideo>();
+  /** Audio-only elements for clips with no visual layer (#100). */
+  private audioElements = new Map<string, HTMLAudioElement>();
+  /** Element keys that failed to decode, so we don't retry them every sync. */
+  private audioLoadFailures = new Set<string>();
   private imageBitmaps = new Map<MediaAssetId, ImageBitmap>();
   private objectUrls = new Map<string, string>();
   /** Rasterized overlays, keyed by item id → { signature, premultiplied bitmap }. */
@@ -244,7 +309,14 @@ class PreviewService {
     this.unsubscribeTransport = transport.subscribe(() => {
       // Pausing/scrubbing must silence media immediately — don't wait for the
       // async sync (which may be mid-decode). This is the authoritative stop.
-      if (!transport.isPlaying()) this.pauseAllExcept(EMPTY_VIDEO_SET);
+      if (!transport.isPlaying()) {
+        this.pauseAllExcept(EMPTY_VIDEO_SET);
+        this.pauseAudioExcept(EMPTY_AUDIO_SET);
+      } else {
+        // Pressing play is a user gesture — the moment to lift the autoplay
+        // suspension on the WebAudio context that all preview audio flows through.
+        void audioGraph.resume();
+      }
       this.scheduleSync();
     });
     this.unsubscribeStore = useTimelineStore.subscribe(
@@ -257,6 +329,7 @@ class PreviewService {
       this.unsubscribeStore?.();
       this.stopAllRvfcLoops();
       this.pauseAllExcept(EMPTY_VIDEO_SET);
+      this.pauseAudioExcept(EMPTY_AUDIO_SET);
       this.sink = null;
     };
   }
@@ -294,6 +367,15 @@ class PreviewService {
     setExpressionFps(fps); // #63: expressions read time = frame / fps
     const actives = resolveActiveClips(project, frame);
     const overlays = resolveActiveOverlays(project, frame);
+    const audioClips = resolveActiveAudioClips(project, frame);
+    const audible = audibleTrackIds(project);
+
+    // Track channel strips carry mute/solo (as a 0/1 gate) and pan. The dB
+    // trim stays folded into per-clip gain below, matching the existing video
+    // path and the export mixdown.
+    for (const track of project.tracks) {
+      audioGraph.setTrackMix(track.id, audible.has(track.id) ? 1 : 0, track.pan ?? 0);
+    }
 
     const wholeFrame = Math.floor(frame);
     const bgGradient = project.settings.backgroundGradient;
@@ -340,10 +422,11 @@ class PreviewService {
       if (bmp) sink.ingestLayerFrame(SUB_ID, bmp, 1_000_000);
     }
 
+    // No visual layer doesn't mean no sound: an audio-only project still has
+    // to play. Retire the video elements, then fall through to the audio pass.
     if (actives.length === 0) {
       this.stopAllRvfcLoops();
-      this.pauseAllExcept(new Set());
-      return;
+      this.pauseAllExcept(EMPTY_VIDEO_SET);
     }
 
     const keepVideos = new Set<RVFCVideo>();
@@ -392,12 +475,15 @@ class PreviewService {
 
       const localFrame = frame - clip.startFrame;
       // Per-clip audio: clip gain + keyframed gain ramp + track mixer trim.
-      // (Track mute overrides everything.) Fade audio with the transition.
+      // (Mute/solo overrides everything.) Fade audio with the transition.
       const rampDb = clip.gainRamp ? sampleAnimatable(clip.gainRamp, localFrame) : 0;
       const transitionAlpha = transition?.alpha ?? 1;
-      video.muted = clip.audioMuted || trackMuted;
-      video.volume = dbToVolume(clip.audioGainDb + rampDb + trackGainDb) * transitionAlpha;
-      void trackId;
+      const silenced = clip.audioMuted || trackMuted || !audible.has(trackId);
+      this.applyElementAudio(
+        video,
+        trackId,
+        silenced ? 0 : dbToVolume(clip.audioGainDb + rampDb + trackGainDb) * transitionAlpha,
+      );
 
       // Ramp-aware source mapping: integrate the (possibly keyframed) speed.
       const instantSpeed = sampleClipSpeed(clip, localFrame);
@@ -413,7 +499,7 @@ class PreviewService {
         }
         if (video.paused) {
           void video.play().catch(() => {
-            /* muted autoplay is permitted; ignore pause races */
+            /* playback only starts from a user gesture; ignore pause races */
           });
         }
         this.ensureRvfcLoop(video, layerId, order);
@@ -439,6 +525,77 @@ class PreviewService {
       if (!keepVideos.has(video)) this.stopRvfcLoop(video);
     }
     this.pauseAllExcept(keepVideos);
+
+    await this.syncAudioClips(audioClips, audible, frame, fps);
+  }
+
+  /**
+   * Drive the <audio> elements for clips with no visual layer (#100). Mirrors
+   * the video branch above: same source mapping, same drift tolerance, same
+   * play/pause gating on the transport.
+   */
+  private async syncAudioClips(
+    audioClips: readonly ActiveAudioClip[],
+    audible: ReadonlySet<TrackId>,
+    frame: number,
+    fps: number,
+  ): Promise<void> {
+    const keep = new Set<HTMLAudioElement>();
+
+    for (const { clip, asset, trackId, elementKey, trackGainDb } of audioClips) {
+      const element = await this.getAudioElement(asset, elementKey);
+      if (!element) continue;
+      keep.add(element);
+
+      const localFrame = frame - clip.startFrame;
+      const rampDb = clip.gainRamp ? sampleAnimatable(clip.gainRamp, localFrame) : 0;
+      const silenced = clip.audioMuted || !audible.has(trackId);
+      this.applyElementAudio(
+        element,
+        trackId,
+        silenced ? 0 : dbToVolume(clip.audioGainDb + rampDb + trackGainDb),
+      );
+
+      const instantSpeed = sampleClipSpeed(clip, localFrame);
+      const mediaTimeS = (clip.sourceInFrame + integrateClipSource(clip, localFrame)) / fps;
+      const duration = Number.isFinite(element.duration) ? element.duration : mediaTimeS + 1;
+      const clampedTimeS = Math.min(Math.max(0, mediaTimeS), Math.max(0, duration - 1 / fps));
+
+      // Transport is re-read here for the same reason as the video branch: a
+      // pause during an earlier await must not leave audio running.
+      if (transport.isPlaying() && instantSpeed > 0) {
+        element.playbackRate = Math.min(16, instantSpeed);
+        if (Math.abs(element.currentTime - clampedTimeS) > DRIFT_TOLERANCE_S) {
+          element.currentTime = clampedTimeS;
+        }
+        if (element.paused) {
+          void element.play().catch(() => {
+            /* gesture/pause races settle on the next sync */
+          });
+        }
+      } else {
+        if (!element.paused) element.pause();
+        if (Math.abs(element.currentTime - clampedTimeS) > 0.5 / fps) {
+          element.currentTime = clampedTimeS;
+        }
+      }
+    }
+
+    this.pauseAudioExcept(keep);
+  }
+
+  /**
+   * Apply a clip's linear gain, preferring the mixer graph so track pan/solo
+   * apply. Falls back to plain element volume when WebAudio is unusable —
+   * without this, a failed graph would silence preview entirely.
+   */
+  private applyElementAudio(element: HTMLMediaElement, trackId: TrackId, linearGain: number): void {
+    if (audioGraph.enabled && audioGraph.attach(element, trackId)) {
+      audioGraph.setClipGain(element, linearGain);
+      return;
+    }
+    element.muted = linearGain <= 0;
+    element.volume = Math.max(0, Math.min(1, linearGain));
   }
 
   // -- per-presented-frame push during playback ------------------------------
@@ -493,6 +650,12 @@ class PreviewService {
     }
   }
 
+  private pauseAudioExcept(keep: ReadonlySet<HTMLAudioElement>): void {
+    for (const element of this.audioElements.values()) {
+      if (!keep.has(element) && !element.paused) element.pause();
+    }
+  }
+
   // -- element / bitmap caches ------------------------------------------------
 
   private async getVideoElement(asset: MediaAsset, cacheKey: string): Promise<RVFCVideo | null> {
@@ -538,6 +701,42 @@ class PreviewService {
         }
       }
       console.error("[WebCut] preview decode failed:", error);
+      return null;
+    }
+  }
+
+  /**
+   * Hidden <audio> element for a clip with no visual layer (#100).
+   *
+   * Always loads the ORIGINAL source, never a proxy: proxies (#51) exist to
+   * make video decode cheap and may re-encode or drop audio entirely. An
+   * <audio> element happily decodes just the audio track of a video file,
+   * which is exactly what a detached-audio clip (#99) points at.
+   */
+  private async getAudioElement(asset: MediaAsset, cacheKey: string): Promise<HTMLAudioElement | null> {
+    const cached = this.audioElements.get(cacheKey);
+    if (cached) return cached;
+    // A video asset with no audio track fails here on every sync otherwise —
+    // remember the miss so it's attempted (and reported) exactly once.
+    if (this.audioLoadFailures.has(cacheKey)) return null;
+    try {
+      const file = await fileSystemService.resolveMediaFile(asset.handleKey);
+      const url = URL.createObjectURL(file);
+      this.objectUrls.set(cacheKey, url);
+      const element = document.createElement("audio");
+      element.src = url;
+      element.preload = "auto";
+      // No crossOrigin — same-origin blob: URL, and CORS mode would both fail
+      // here and block the MediaElementSource the mixer graph needs.
+      await new Promise<void>((resolve, reject) => {
+        element.onloadeddata = () => resolve();
+        element.onerror = () => reject(new Error(`Cannot decode audio for "${asset.name}"`));
+      });
+      this.audioElements.set(cacheKey, element);
+      return element;
+    } catch (error) {
+      this.audioLoadFailures.add(cacheKey);
+      console.error("[WebCut] preview audio decode failed:", error);
       return null;
     }
   }
@@ -669,17 +868,27 @@ class PreviewService {
   dispose(): void {
     this.stopAllRvfcLoops();
     for (const video of this.videoElements.values()) {
+      audioGraph.release(video);
       video.pause();
       video.removeAttribute("src");
       video.load();
+    }
+    for (const element of this.audioElements.values()) {
+      audioGraph.release(element);
+      element.pause();
+      element.removeAttribute("src");
+      element.load();
     }
     for (const url of this.objectUrls.values()) URL.revokeObjectURL(url);
     for (const bitmap of this.imageBitmaps.values()) bitmap.close();
     for (const entry of this.overlayCache.values()) entry.bitmap.close();
     this.videoElements.clear();
+    this.audioElements.clear();
+    this.audioLoadFailures.clear();
     this.imageBitmaps.clear();
     this.objectUrls.clear();
     this.overlayCache.clear();
+    audioGraph.dispose();
   }
 }
 
