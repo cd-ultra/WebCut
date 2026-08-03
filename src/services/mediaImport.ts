@@ -74,15 +74,29 @@ export const probeMedia = (
  * Register handle-less File objects (dropped/pasted) as blobs and build
  * MediaAsset descriptors. Returns the descriptors; the caller adds them.
  */
-export const ingestFiles = async (files: readonly File[], frameRate: number): Promise<MediaAsset[]> => {
+export interface IngestOptions {
+  /**
+   * Callback fired when a background proxy job finishes for one of the ingested
+   * assets. The consumer patches the asset via the store's `updateAsset`.
+   */
+  readonly onProxyReady?: (assetId: MediaAssetId, proxy: { handleKey: string; width: number; height: number }) => void;
+}
+
+export const ingestFiles = async (
+  files: readonly File[],
+  frameRate: number,
+  options: IngestOptions = {},
+): Promise<MediaAsset[]> => {
   const assets: MediaAsset[] = [];
+  const proxyBatch: Array<{ id: MediaAssetId; file: File; name: string }> = [];
   for (const file of files) {
     if (!isMediaFile(file)) continue;
     const kind = classifyMedia(file.type || "", file.name);
     const handleKey = await fileSystemService.registerBlobFile(file);
     const probed = await probeMedia(file, kind);
+    const id = createId<MediaAssetId>();
     assets.push({
-      id: createId<MediaAssetId>(),
+      id,
       kind,
       name: file.name || `Pasted ${kind}`,
       handleKey,
@@ -93,6 +107,25 @@ export const ingestFiles = async (files: readonly File[], frameRate: number): Pr
       mimeType: file.type || "application/octet-stream",
       fileSizeBytes: file.size,
     });
+    // Only video (or video-like) files qualify for proxy generation. The
+    // ProxyService skips anything already ≤ its minSourceHeight (default 720).
+    if (kind === "video" && options.onProxyReady) {
+      proxyBatch.push({ id, file, name: file.name || "clip" });
+    }
+  }
+
+  // Kick proxy generation on the microtask tail so the import call returns
+  // fast; the queue emits progress via its own subscribers.
+  if (proxyBatch.length > 0 && options.onProxyReady) {
+    const cb = options.onProxyReady;
+    void (async () => {
+      const { proxyService, getUseProxies } = await import("./ProxyService");
+      if (!getUseProxies()) return;
+      for (const entry of proxyBatch) {
+        const result = await proxyService.enqueue(entry.file, entry.name);
+        if (result) cb(entry.id, result);
+      }
+    })();
   }
   return assets;
 };

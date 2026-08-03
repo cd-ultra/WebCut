@@ -35,6 +35,7 @@ import {
   type Marker,
   type MarkerId,
   type MediaAsset,
+  type MediaAssetId,
   type Project,
   type ProjectSettings,
   type Subtitle,
@@ -204,6 +205,7 @@ export interface TimelineState {
   setPixelsPerFrame(ppf: number): void;
   zoomBy(factor: number): void;
   addAsset(asset: MediaAsset): void;
+  updateAsset(assetId: MediaAssetId, patch: Partial<MediaAsset>): void;
   addClipToTrack(trackId: TrackId, clip: Omit<ClipItem, "id">): TrackItemId;
   addItemToTrack(trackId: TrackId, item: Omit<TrackItem, "id">): TrackItemId;
   moveItem(itemId: TrackItemId, deltaFrames: number, targetTrackId?: TrackId): void;
@@ -434,6 +436,18 @@ export const useTimelineStore = create<TimelineState>()(
         project: { ...state.project, assets: [...state.project.assets, asset] },
         revision: state.revision + 1,
         ...pushPast(state),
+      })),
+
+    // Mutating an asset (e.g. attaching a proxyHandleKey after background
+    // proxy generation completes) shouldn't create an undo entry — it's a
+    // machine-generated derivative, not a user edit.
+    updateAsset: (assetId, patch) =>
+      set((state) => ({
+        project: {
+          ...state.project,
+          assets: state.project.assets.map((a) => (a.id === assetId ? { ...a, ...patch } : a)),
+        },
+        revision: state.revision + 1,
       })),
 
     addClipToTrack: (trackId, clip) => {

@@ -344,6 +344,16 @@ export interface MediaAsset {
   readonly frameRate?: number;
   readonly mimeType: string;
   readonly fileSizeBytes: number;
+  /**
+   * Proxy media (#51): a smaller, faster-to-decode copy generated from the
+   * source. Preview uses it when available; export always reads the original.
+   * Absent ⇒ no proxy has been generated (or generation failed / was skipped).
+   */
+  readonly proxyHandleKey?: string;
+  /** Width of the proxy, when present. */
+  readonly proxyWidth?: number;
+  /** Height of the proxy, when present. */
+  readonly proxyHeight?: number;
 }
 
 // ---------------------------------------------------------------------------
