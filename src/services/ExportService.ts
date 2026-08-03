@@ -26,10 +26,12 @@ import { fileSystemService } from "./FileSystemService";
 import {
   corridorKeyOf,
   dbToVolume,
+  drawAudioVizItem,
   drawShapeItem,
   drawStickerItem,
   drawSubtitle,
   drawTextItem,
+  getWaveformPeaks,
   resolveActiveClips,
   resolveActiveOverlays,
 } from "./PreviewService";
@@ -226,7 +228,12 @@ export const exportProject = async (
     rctx.scale(scale.x, scale.y);
     if (item.type === "text") drawTextItem(rctx as unknown as CanvasRenderingContext2D, item);
     else if (item.type === "shape") drawShapeItem(rctx as unknown as CanvasRenderingContext2D, item, width, height);
-    else drawStickerItem(rctx as unknown as CanvasRenderingContext2D, item);
+    else if (item.type === "sticker") drawStickerItem(rctx as unknown as CanvasRenderingContext2D, item);
+    else {
+      const asset = project.assets.find((a) => a.id === item.assetId);
+      const peaks = asset ? await getWaveformPeaks(asset) : null;
+      drawAudioVizItem(rctx as unknown as CanvasRenderingContext2D, item, peaks, local, item.durationFrames);
+    }
     rctx.restore();
     return createImageBitmap(rasterCanvas, { premultiplyAlpha: "premultiply" });
   };
@@ -370,6 +377,7 @@ const projectHasAudio = (project: Project, startFrame: number, endFrame: number)
 };
 
 const decodeCache = new Map<string, AudioBuffer>();
+const denoiseCache = new Map<string, AudioBuffer>();
 
 const mixAndEncodeAudio = async (
   project: Project,
@@ -407,8 +415,24 @@ const mixAndEncodeAudio = async (
       }
       if (signal?.aborted) throw new DOMException("Export cancelled", "AbortError");
 
+      // Noise reduction (#58): spectral subtraction on the decoded buffer.
+      // Cached separately per (asset, strength) so a shared source isn't
+      // re-denoised for every clip that references it.
+      let playBuffer = buffer;
+      const strength = clip.denoiseStrength ?? 0;
+      if (strength > 0) {
+        const key = `${asset.handleKey}|dn${strength.toFixed(2)}`;
+        let denoised = denoiseCache.get(key);
+        if (!denoised) {
+          const { denoiseAudioBuffer } = await import("./denoise");
+          denoised = denoiseAudioBuffer(ctx, buffer, strength);
+          denoiseCache.set(key, denoised);
+        }
+        playBuffer = denoised;
+      }
+
       const src = ctx.createBufferSource();
-      src.buffer = buffer;
+      src.buffer = playBuffer;
       src.playbackRate.value = Math.max(0.01, Math.abs(clip.speed));
 
       const gainNode = ctx.createGain();

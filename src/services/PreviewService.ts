@@ -15,6 +15,7 @@
 
 import { fileSystemService } from "./FileSystemService";
 import { getUseProxies } from "./ProxyService";
+import { getWaveform } from "./waveform";
 import { transport, useTimelineStore } from "../store/timelineStore";
 import {
   defaultCorridorKeyParams,
@@ -31,6 +32,7 @@ import {
   type GradientFill,
   type MediaAsset,
   type MediaAssetId,
+  type AudioVizItem,
   type OverlayItem,
   type Project,
   type ProjectSettings,
@@ -548,11 +550,21 @@ class PreviewService {
       rotation: sampleAnimatable(item.transform.rotation, local),
       opacity: sampleAnimatable(item.transform.opacity, local),
     };
-    const sig = overlaySignature(item, settings, t);
+    // Audio visualizer re-rasterizes per frame (it scrolls with playback), so
+    // its signature carries the local frame; static overlays cache normally.
+    const sig = item.type === "audioviz"
+      ? `${overlaySignature(item, settings, t)}|f${local}`
+      : overlaySignature(item, settings, t);
     const cached = this.overlayCache.get(item.id);
     if (cached && cached.sig === sig) return cached.bitmap;
     try {
-      const bitmap = await this.rasterizeOverlay(item, settings, t);
+      // Pre-load waveform peaks for the visualizer before the synchronous draw.
+      let peaks: readonly number[] | null = null;
+      if (item.type === "audioviz") {
+        const asset = useTimelineStore.getState().project.assets.find((a) => a.id === item.assetId);
+        if (asset) peaks = await getWaveformPeaks(asset);
+      }
+      const bitmap = await this.rasterizeOverlay(item, settings, t, local, peaks);
       cached?.bitmap.close();
       this.overlayCache.set(item.id, { sig, bitmap });
       return bitmap;
@@ -566,6 +578,8 @@ class PreviewService {
     item: OverlayItem,
     settings: ProjectSettings,
     t: SampledTransform,
+    localFrame = 0,
+    peaks: readonly number[] | null = null,
   ): Promise<ImageBitmap> {
     const w = settings.width;
     const h = settings.height;
@@ -587,7 +601,8 @@ class PreviewService {
     ctx.scale(t.scale.x, t.scale.y);
     if (item.type === "text") drawTextItem(ctx, item);
     else if (item.type === "shape") drawShapeItem(ctx, item, w, h);
-    else drawStickerItem(ctx, item);
+    else if (item.type === "sticker") drawStickerItem(ctx, item);
+    else drawAudioVizItem(ctx, item, peaks, localFrame, item.durationFrames);
     ctx.restore();
     // Premultiply so the compositor's premultiplied "over" blend is correct.
     return createImageBitmap(canvas, { premultiplyAlpha: "premultiply" });
@@ -650,6 +665,75 @@ class PreviewService {
 
 const STICKER_BASE_PX = 220;
 
+/**
+ * Waveform-peak cache for the audio visualizer overlay (#65). Keyed by the
+ * asset's handleKey; a `null` sentinel means "loaded but no waveform".
+ */
+const audioVizPeaks = new Map<string, number[] | null>();
+
+/** Load (and memoize) an asset's normalized waveform peaks for the visualizer. */
+export const getWaveformPeaks = async (asset: MediaAsset): Promise<number[] | null> => {
+  const key = asset.handleKey;
+  if (audioVizPeaks.has(key)) return audioVizPeaks.get(key) ?? null;
+  const peaks = await getWaveform(asset);
+  audioVizPeaks.set(key, peaks);
+  return peaks;
+};
+
+/**
+ * Draw the audio waveform visualizer, centered at the current (already
+ * transformed) origin. `localFrame` scrolls the window across the peaks so the
+ * visual reacts to playback. Pure — the caller supplies the peaks.
+ */
+export const drawAudioVizItem = (
+  ctx: CanvasRenderingContext2D,
+  item: AudioVizItem,
+  peaks: readonly number[] | null,
+  localFrame: number,
+  totalFrames: number,
+): void => {
+  const W = 960;
+  const H = 280;
+  const n = Math.max(4, Math.min(256, item.barCount));
+  ctx.fillStyle = item.color;
+  ctx.strokeStyle = item.color;
+  ctx.lineWidth = Math.max(2, W / n / 3);
+
+  const sampleAt = (i: number): number => {
+    if (!peaks || peaks.length === 0) return 0.05;
+    const frac = totalFrames > 0 ? localFrame / totalFrames : 0;
+    const center = Math.floor(frac * peaks.length);
+    const idx = center - Math.floor(n / 2) + i;
+    if (idx < 0 || idx >= peaks.length) return 0;
+    return Math.max(0, Math.min(1, peaks[idx]));
+  };
+
+  if (item.style === "wave") {
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = -W / 2 + (i / (n - 1)) * W;
+      const y = -sampleAt(i) * H * 0.5;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    return;
+  }
+
+  const barW = (W / n) * 0.7;
+  for (let i = 0; i < n; i++) {
+    const v = sampleAt(i);
+    const bh = Math.max(2, v * H);
+    const x = -W / 2 + (i / n) * W;
+    if (item.style === "mirror") {
+      ctx.fillRect(x, -bh * 0.5, barW, bh);
+    } else {
+      // "bars" — grow upward from a baseline.
+      ctx.fillRect(x, H * 0.5 - bh, barW, bh);
+    }
+  }
+};
+
 const overlaySignature = (item: OverlayItem, settings: ProjectSettings, t: SampledTransform): string => {
   const base = `${settings.width}x${settings.height}|${t.pos.x},${t.pos.y}|${t.scale.x},${t.scale.y}|${t.rotation}|${t.opacity}`;
   if (item.type === "text") {
@@ -657,6 +741,9 @@ const overlaySignature = (item: OverlayItem, settings: ProjectSettings, t: Sampl
   }
   if (item.type === "sticker") {
     return `sticker|${base}|${item.content}`;
+  }
+  if (item.type === "audioviz") {
+    return `audioviz|${base}|${item.assetId}|${item.style}|${item.color}|${item.barCount}`;
   }
   return `shape|${base}|${item.shape}|${item.fillColor}|${item.strokeColor}|${item.strokeWidthPx}|${item.cornerRadiusPx}|${JSON.stringify(item.fillGradient ?? null)}`;
 };
