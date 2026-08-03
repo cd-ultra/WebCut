@@ -263,6 +263,10 @@ export interface TimelineState {
   setClipTransition(itemId: TrackItemId, edge: "in" | "out", transition: Transition | null): void;
   // shape mask (#13): null clears.
   setClipMask(itemId: TrackItemId, mask: ShapeMask | null): void;
+  // multicam (#49): angles null clears.
+  setClipMulticam(itemId: TrackItemId, multicam: { angles: readonly MediaAssetId[]; angleSelection: AnimatableValue<number> } | null): void;
+  /** Insert / replace a keyframe on the clip's multicam angleSelection at localFrame. */
+  setMulticamAngleAt(itemId: TrackItemId, localFrame: number, angleIndex: number): void;
   // clipboard + history
   copySelection(): void;
   cutSelection(): void;
@@ -1099,6 +1103,49 @@ export const useTimelineStore = create<TimelineState>()(
         }),
         revision: state.revision + 1,
         ...pushPastCoalesced(state, `mask:${itemId}`),
+      })),
+
+    // -- multicam (#49) ---------------------------------------------------------
+
+    setClipMulticam: (itemId, multicam) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) => {
+          if (item.id !== itemId || item.type !== "clip") return item;
+          if (multicam) return { ...item, multicam } as TrackItem;
+          const { multicam: _drop, ...rest } = item;
+          void _drop;
+          return rest as TrackItem;
+        }),
+        revision: state.revision + 1,
+        ...pushPast(state),
+      })),
+
+    setMulticamAngleAt: (itemId, localFrame, angleIndex) =>
+      set((state) => ({
+        project: mapItems(state.project, (item) => {
+          if (item.id !== itemId || item.type !== "clip" || !item.multicam) return item;
+          const existing = item.multicam.angleSelection;
+          const keyframes = existing.kind === "animated" ? existing.keyframes : [];
+          const whole = Math.max(0, Math.round(localFrame));
+          const kf: Keyframe<number> = {
+            id: createId<KeyframeId>(),
+            frame: whole,
+            value: angleIndex,
+            // Angle changes are hard cuts — never interpolate between angles.
+            interpolation: "hold",
+          };
+          const filtered = keyframes.filter((k) => k.frame !== whole);
+          const nextAngleSelection: AnimatableValue<number> = {
+            kind: "animated",
+            keyframes: [...filtered, kf].sort((a, b) => a.frame - b.frame),
+          };
+          return {
+            ...item,
+            multicam: { ...item.multicam, angleSelection: nextAngleSelection },
+          } as TrackItem;
+        }),
+        revision: state.revision + 1,
+        ...pushPastCoalesced(state, `multicam:${itemId}`),
       })),
 
     // -- audio automation (#53 ducking) -----------------------------------------
