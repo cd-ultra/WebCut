@@ -129,7 +129,21 @@ const ITEM_COLORS: Record<TrackItem["type"], string> = {
 };
 
 /** Canvas waveform overlay for audio-bearing clips. */
-const WaveformStrip = ({ asset, width, height }: { asset: MediaAsset; width: number; height: number }) => {
+const WaveformStrip = ({
+  asset,
+  width,
+  height,
+  sourceInFrame,
+  sourceFrames,
+}: {
+  asset: MediaAsset;
+  width: number;
+  height: number;
+  /** In-point of this clip within the source media, in source frames. */
+  sourceInFrame: number;
+  /** Length of source media this clip consumes, in source frames (duration × |speed|). */
+  sourceFrames: number;
+}) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [peaks, setPeaks] = useState<number[] | null>(null);
   useEffect(() => {
@@ -151,12 +165,19 @@ const WaveformStrip = ({ asset, width, height }: { asset: MediaAsset; width: num
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = "rgba(255,255,255,0.35)";
     const mid = canvas.height / 2;
+    // The peaks span the WHOLE source asset. Map this clip's pixel width onto
+    // only the source slice it actually covers — so a razor-cut piece shows the
+    // matching portion of the waveform, not the whole thing.
+    const srcDur = asset.durationFrames > 0 ? asset.durationFrames : Math.max(1, sourceInFrame + sourceFrames);
+    const startFrac = Math.max(0, Math.min(1, sourceInFrame / srcDur));
+    const endFrac = Math.max(startFrac, Math.min(1, (sourceInFrame + sourceFrames) / srcDur));
     for (let x = 0; x < canvas.width; x++) {
-      const peak = peaks[Math.floor((x / canvas.width) * peaks.length)] ?? 0;
+      const frac = startFrac + (x / canvas.width) * (endFrac - startFrac);
+      const peak = peaks[Math.min(peaks.length - 1, Math.floor(frac * peaks.length))] ?? 0;
       const h = Math.max(1, peak * (canvas.height - 2));
       ctx.fillRect(x, mid - h / 2, 1, h);
     }
-  }, [peaks, width, height]);
+  }, [peaks, width, height, asset.durationFrames, sourceInFrame, sourceFrames]);
   if (!peaks) return null;
   return <canvas ref={canvasRef} className="pointer-events-none absolute inset-x-0 bottom-0" style={{ height }} />;
 };
@@ -195,8 +216,14 @@ const ClipBlock = ({
       } ${item.locked ? "opacity-50" : ""}`}
       style={style}
     >
-      {asset && asset.kind !== "image" && (
-        <WaveformStrip asset={asset} width={width} height={Math.max(10, (track.heightPx - 8) * 0.6)} />
+      {asset && asset.kind !== "image" && item.type === "clip" && (
+        <WaveformStrip
+          asset={asset}
+          width={width}
+          height={Math.max(10, (track.heightPx - 8) * 0.6)}
+          sourceInFrame={item.sourceInFrame}
+          sourceFrames={item.durationFrames * Math.max(0.01, Math.abs(item.speed))}
+        />
       )}
       <span className="pointer-events-none relative block truncate px-1.5 pt-0.5 text-[10px] font-medium text-white/90">
         {item.name}

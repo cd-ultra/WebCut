@@ -498,12 +498,12 @@ class PreviewService {
   private async getVideoElement(asset: MediaAsset, cacheKey: string): Promise<RVFCVideo | null> {
     const cached = this.videoElements.get(cacheKey);
     if (cached) return cached;
-    try {
-      // Proxy preference (#51): if a proxy exists and proxies are enabled
-      // globally, load the smaller/faster file. Export always uses the
-      // original — that path bypasses PreviewService entirely.
-      const useProxy = asset.proxyHandleKey && getUseProxies();
-      const handleKey = useProxy ? asset.proxyHandleKey! : asset.handleKey;
+    // Proxy preference (#51): if a proxy exists and proxies are enabled
+    // globally, load the smaller/faster file. Export always uses the original.
+    // If the proxy fails to load (malformed re-encode), fall back to the
+    // original so the preview never goes black on a bad proxy.
+    const useProxy = !!asset.proxyHandleKey && getUseProxies();
+    const tryLoad = async (handleKey: string): Promise<RVFCVideo> => {
       const file = await fileSystemService.resolveMediaFile(handleKey);
       const url = URL.createObjectURL(file);
       this.objectUrls.set(cacheKey, url);
@@ -517,9 +517,24 @@ class PreviewService {
         video.onloadeddata = () => resolve();
         video.onerror = () => reject(new Error(`Cannot decode "${asset.name}"`));
       });
+      return video;
+    };
+    try {
+      const video = await tryLoad(useProxy ? asset.proxyHandleKey! : asset.handleKey);
       this.videoElements.set(cacheKey, video);
       return video;
     } catch (error) {
+      if (useProxy) {
+        // Proxy was bad — retry with the original source.
+        try {
+          const video = await tryLoad(asset.handleKey);
+          this.videoElements.set(cacheKey, video);
+          return video;
+        } catch (fallbackError) {
+          console.error("[WebCut] preview decode failed (proxy + original):", fallbackError);
+          return null;
+        }
+      }
       console.error("[WebCut] preview decode failed:", error);
       return null;
     }
