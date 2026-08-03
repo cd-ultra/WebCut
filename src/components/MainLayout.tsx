@@ -112,6 +112,7 @@ import {
   type MotionGraphicsTemplate,
   type TemplateValues,
 } from "../services/templates";
+import { getUseProxies, proxyService, setUseProxies, subscribeUseProxies, type ProxyJob } from "../services/ProxyService";
 import { EXPORT_PRESETS, type ExportPreset } from "../services/ExportPresets";
 import { exportQueue, type ExportJob } from "../services/ExportQueue";
 import { getWaveform } from "../services/waveform";
@@ -291,7 +292,15 @@ const MediaPool = () => {
       if (media.length === 0) return;
       setError(null);
       try {
-        const created = await ingestFiles(media, frameRate);
+        const created = await ingestFiles(media, frameRate, {
+          onProxyReady: (assetId, proxy) => {
+            useTimelineStore.getState().updateAsset(assetId, {
+              proxyHandleKey: proxy.handleKey,
+              proxyWidth: proxy.width,
+              proxyHeight: proxy.height,
+            });
+          },
+        });
         for (const asset of created) addAsset(asset);
       } catch (dropError) {
         setError(dropError instanceof Error ? dropError.message : String(dropError));
@@ -2442,6 +2451,50 @@ const ExportPanel = ({ onClose, onStatus }: { onClose: () => void; onStatus: (ms
 };
 
 // ---------------------------------------------------------------------------
+// Proxy indicator (#51): status chip + toggle in the toolbar
+// ---------------------------------------------------------------------------
+
+const ProxyIndicator = () => {
+  const [jobs, setJobs] = useState<readonly ProxyJob[]>(proxyService.getJobs());
+  const [useProxies, setUseProxiesState] = useState(getUseProxies());
+  useEffect(() => {
+    const unsub1 = proxyService.subscribe(setJobs);
+    const unsub2 = subscribeUseProxies(setUseProxiesState);
+    return () => { unsub1(); unsub2(); };
+  }, []);
+
+  const running = jobs.filter((j) => j.status === "running" || j.status === "pending");
+  const done = jobs.filter((j) => j.status === "done").length;
+  const errored = jobs.filter((j) => j.status === "error").length;
+
+  const label = running.length > 0
+    ? `Optimizing… ${Math.round((running[0].progress || 0) * 100)}%`
+    : done > 0 || errored > 0
+      ? `${done} proxy${done === 1 ? "" : "ies"}${errored > 0 ? ` · ${errored} err` : ""}`
+      : "";
+
+  return (
+    <div className="flex items-center gap-1">
+      {label && (
+        <span
+          title={running.map((j) => `${j.assetName} — ${Math.round(j.progress * 100)}%`).join("\n") || label}
+          className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${running.length > 0 ? "bg-accent-warm/20 text-accent-warm" : "text-neutral-500"}`}
+        >
+          {label}
+        </span>
+      )}
+      <button
+        onClick={() => setUseProxies(!useProxies)}
+        title={useProxies ? "Preview uses proxy media when available. Click to disable." : "Previews use full-resolution originals. Click to enable proxies."}
+        className={`rounded border px-1.5 py-1 text-[11px] ${useProxies ? "border-accent-warm/60 text-accent-warm hover:bg-accent-warm/10" : "border-edge text-neutral-400 hover:border-accent/60"}`}
+      >
+        Proxy: {useProxies ? "on" : "off"}
+      </button>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Motion-graphics templates (#62)
 // ---------------------------------------------------------------------------
 
@@ -3028,7 +3081,15 @@ export const MainLayout = () => {
       const media = files.filter(isMediaFile);
       if (media.length === 0) return;
       try {
-        const created = await ingestFiles(media, frameRate);
+        const created = await ingestFiles(media, frameRate, {
+          onProxyReady: (assetId, proxy) => {
+            useTimelineStore.getState().updateAsset(assetId, {
+              proxyHandleKey: proxy.handleKey,
+              proxyWidth: proxy.width,
+              proxyHeight: proxy.height,
+            });
+          },
+        });
         for (const asset of created) addAsset(asset);
         setStatusMessage(`Imported ${created.length} ${label}`);
         window.setTimeout(() => setStatusMessage(null), 2500);
@@ -3128,6 +3189,7 @@ export const MainLayout = () => {
         <button onClick={() => setModal("templates")} title="Motion graphics templates" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
           <LayoutTemplate size={12} />
         </button>
+        <ProxyIndicator />
         <button
           onClick={() => setShowDiag(true)}
           title="Diagnostics"

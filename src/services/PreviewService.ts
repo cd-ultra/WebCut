@@ -14,6 +14,7 @@
  */
 
 import { fileSystemService } from "./FileSystemService";
+import { getUseProxies } from "./ProxyService";
 import { transport, useTimelineStore } from "../store/timelineStore";
 import {
   defaultCorridorKeyParams,
@@ -459,7 +460,12 @@ class PreviewService {
     const cached = this.videoElements.get(cacheKey);
     if (cached) return cached;
     try {
-      const file = await fileSystemService.resolveMediaFile(asset.handleKey);
+      // Proxy preference (#51): if a proxy exists and proxies are enabled
+      // globally, load the smaller/faster file. Export always uses the
+      // original — that path bypasses PreviewService entirely.
+      const useProxy = asset.proxyHandleKey && getUseProxies();
+      const handleKey = useProxy ? asset.proxyHandleKey! : asset.handleKey;
+      const file = await fileSystemService.resolveMediaFile(handleKey);
       const url = URL.createObjectURL(file);
       this.objectUrls.set(cacheKey, url);
       const video = document.createElement("video") as RVFCVideo;
