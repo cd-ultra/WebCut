@@ -357,6 +357,21 @@ class PreviewService {
         continue;
       }
 
+      // Nested sequence (#50): rasterize the nested project at the mapped
+      // local frame into an ImageBitmap and feed it as a layer source.
+      if (asset.kind === "sequence" && asset.nestedProject) {
+        const localFrame = frame - clip.startFrame;
+        const nestedFrame = clip.sourceInFrame + localFrame * clip.speed;
+        try {
+          const { rasterizeNestedFrame } = await import("./nestedSequence");
+          const bitmap = await rasterizeNestedFrame(asset.nestedProject, nestedFrame);
+          sink.ingestLayerFrame(layerId, bitmap, order);
+        } catch (err) {
+          console.error("[WebCut] nested sequence render failed:", err);
+        }
+        continue;
+      }
+
       // Cache per layer: the same source file on two layers (e.g. two clips
       // from the same asset overlapping during a transition) needs two
       // independent elements, each seeking its own media time.

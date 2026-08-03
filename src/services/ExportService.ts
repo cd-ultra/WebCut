@@ -257,6 +257,16 @@ export const exportProject = async (
           if (bmp) compositor.ingestLayerFrame(layerId, bmp, order);
           continue;
         }
+        // Nested sequence (#50): rasterize the nested project frame.
+        if (asset.kind === "sequence" && asset.nestedProject) {
+          const localFrame = f - clip.startFrame;
+          const nestedFrame = clip.sourceInFrame + localFrame * clip.speed;
+          const { rasterizeNestedFrame } = await import("./nestedSequence");
+          const bmp = await rasterizeNestedFrame(asset.nestedProject, nestedFrame);
+          compositor.ingestLayerFrame(layerId, bmp, order);
+          bmp.close();
+          continue;
+        }
         const el = await getVideoEl(asset, `${layerId}:${asset.handleKey}`);
         const localFrame = f - clip.startFrame;
         const srcTime = (clip.sourceInFrame + localFrame * Math.abs(sampleClipSpeed(clip, localFrame))) / fps;
