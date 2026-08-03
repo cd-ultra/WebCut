@@ -23,6 +23,7 @@ import {
   Import,
   Keyboard,
   LayoutDashboard,
+  LayoutTemplate,
   LayoutGrid,
   List,
   Music,
@@ -102,6 +103,15 @@ import { chordFromEvent, COMMANDS, prettyChord, resetBindings, setBinding, useKe
 import { evalCurve, parseCubeLut, registerLut } from "../effects/lut";
 import { projectEndFrame, type ExportFormat } from "../services/ExportService";
 import { segmentsToSubtitleFrames, transcribeProject } from "../services/transcription";
+import {
+  applyTemplate,
+  BUILT_IN_TEMPLATES,
+  loadTemplates,
+  saveTemplates,
+  templateFromOverlays,
+  type MotionGraphicsTemplate,
+  type TemplateValues,
+} from "../services/templates";
 import { EXPORT_PRESETS, type ExportPreset } from "../services/ExportPresets";
 import { exportQueue, type ExportJob } from "../services/ExportQueue";
 import { getWaveform } from "../services/waveform";
@@ -2432,6 +2442,171 @@ const ExportPanel = ({ onClose, onStatus }: { onClose: () => void; onStatus: (ms
 };
 
 // ---------------------------------------------------------------------------
+// Motion-graphics templates (#62)
+// ---------------------------------------------------------------------------
+
+const TemplatesPanel = ({ onClose, onStatus }: { onClose: () => void; onStatus: (m: string) => void }) => {
+  const tracks = useTimelineStore((s) => s.project.tracks);
+  const selectedItemIds = useTimelineStore((s) => s.selectedItemIds);
+  const addItemToTrack = useTimelineStore((s) => s.addItemToTrack);
+  const armedTrackId = useTimelineStore((s) => s.armedTrackId);
+  const [userTemplates, setUserTemplates] = useState<MotionGraphicsTemplate[]>(() => loadTemplates());
+  const [selected, setSelected] = useState<MotionGraphicsTemplate | null>(null);
+  const [values, setValues] = useState<TemplateValues>({});
+
+  const templates = [...BUILT_IN_TEMPLATES, ...userTemplates];
+
+  const openTemplate = (t: MotionGraphicsTemplate) => {
+    setSelected(t);
+    const init: TemplateValues = {};
+    for (const p of t.params) init[p.name] = p.defaultValue;
+    setValues(init);
+  };
+
+  const saveFromSelection = () => {
+    const overlays: import("../types/timeline").OverlayItem[] = [];
+    for (const track of tracks) {
+      for (const item of track.items) {
+        if (!selectedItemIds.includes(item.id)) continue;
+        if (item.type === "text" || item.type === "shape" || item.type === "sticker") {
+          overlays.push(item);
+        }
+      }
+    }
+    if (overlays.length === 0) {
+      onStatus("Select some overlays first (text / shape / sticker).");
+      return;
+    }
+    const name = prompt("Template name:");
+    if (!name) return;
+    const t = templateFromOverlays(name, overlays);
+    const next = [...userTemplates, t];
+    setUserTemplates(next);
+    saveTemplates(next);
+    onStatus(`Saved template “${name}”.`);
+  };
+
+  const applyToTimeline = () => {
+    if (!selected) return;
+    const target = tracks.find((t) => t.id === armedTrackId) ?? tracks.find((t) => t.kind === "video" && !t.locked);
+    if (!target) {
+      onStatus("No visual track available. Add one first.");
+      return;
+    }
+    const startFrame = Math.round(transport.getFrame());
+    const overlays = applyTemplate(selected, values, startFrame);
+    for (const o of overlays) {
+      addItemToTrack(target.id, o);
+    }
+    onStatus(`Applied “${selected.name}” at frame ${startFrame}.`);
+    onClose();
+  };
+
+  const removeTemplate = (id: string) => {
+    if (BUILT_IN_TEMPLATES.some((b) => b.id === id)) return; // built-ins are immutable
+    const next = userTemplates.filter((t) => t.id !== id);
+    setUserTemplates(next);
+    saveTemplates(next);
+    if (selected?.id === id) setSelected(null);
+  };
+
+  return (
+    <Modal title="MOTION GRAPHICS TEMPLATES" icon={<LayoutTemplate size={14} className="text-accent" />} onClose={onClose} wide>
+      <div className="grid grid-cols-2 gap-4">
+        {/* Gallery */}
+        <div>
+          <div className="mb-2 flex items-center justify-between">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-neutral-500">Gallery</p>
+            <button onClick={saveFromSelection} className="rounded border border-edge px-1.5 py-0.5 text-[10px] text-neutral-300 hover:border-accent/60">
+              + Save selection
+            </button>
+          </div>
+          <div className="max-h-[55vh] space-y-1 overflow-y-auto pr-1">
+            {templates.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => openTemplate(t)}
+                className={`flex w-full items-center justify-between rounded border px-2 py-1.5 text-left text-[11px] ${
+                  selected?.id === t.id ? "border-accent bg-accent/10 text-neutral-100" : "border-edge text-neutral-300 hover:border-accent/60"
+                }`}
+              >
+                <span>
+                  <span className="block font-medium">{t.name}</span>
+                  <span className="text-[9px] text-neutral-500">
+                    {t.overlays.length} overlay{t.overlays.length === 1 ? "" : "s"} · {t.durationFrames}f · {t.params.length} param{t.params.length === 1 ? "" : "s"}
+                  </span>
+                </span>
+                {!BUILT_IN_TEMPLATES.some((b) => b.id === t.id) && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); removeTemplate(t.id); }}
+                    className="ml-2 rounded border border-edge px-1 text-[9px] text-neutral-500 hover:border-red-500/60"
+                    title="Delete template"
+                  >✕</button>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Detail / apply */}
+        <div className="space-y-2">
+          {!selected && (
+            <p className="rounded border border-dashed border-edge/70 p-3 text-[10px] text-neutral-500">
+              Pick a template on the left to preview its parameters and apply it at the playhead.
+            </p>
+          )}
+          {selected && (
+            <>
+              <p className="text-[11px] font-medium text-neutral-200">{selected.name}</p>
+              {selected.params.length === 0 && (
+                <p className="text-[10px] text-neutral-500">No parameters — applies as-is.</p>
+              )}
+              {selected.params.map((p) => (
+                <label key={p.name} className="block">
+                  <span className="mb-0.5 block text-[10px] text-neutral-400">{p.name}</span>
+                  {p.kind === "text" && (
+                    <input
+                      value={String(values[p.name] ?? p.defaultValue)}
+                      onChange={(e) => setValues((v) => ({ ...v, [p.name]: e.target.value }))}
+                      className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200 outline-none"
+                    />
+                  )}
+                  {p.kind === "color" && (
+                    <input
+                      type="color"
+                      value={String(values[p.name] ?? p.defaultValue).slice(0, 7)}
+                      onChange={(e) => setValues((v) => ({ ...v, [p.name]: e.target.value }))}
+                      className="h-7 w-full rounded border border-edge bg-transparent"
+                    />
+                  )}
+                  {p.kind === "number" && (
+                    <input
+                      type="number"
+                      value={Number(values[p.name] ?? p.defaultValue)}
+                      onChange={(e) => setValues((v) => ({ ...v, [p.name]: Number(e.target.value) }))}
+                      className="w-full rounded border border-edge bg-panel-raised px-1.5 py-1 text-[11px] text-neutral-200 outline-none"
+                    />
+                  )}
+                </label>
+              ))}
+              <button
+                onClick={applyToTimeline}
+                className="w-full rounded bg-accent/90 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-accent"
+              >
+                Apply at playhead
+              </button>
+              <p className="text-[10px] text-neutral-600">
+                Overlays land on the armed video track (or the first unlocked video track).
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Diagnostics panel
 // ---------------------------------------------------------------------------
 
@@ -2840,7 +3015,7 @@ export const MainLayout = () => {
   const frameRate = useTimelineStore((state) => state.project.settings.frameRate);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [showDiag, setShowDiag] = useState(false);
-  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes" | "mixer" | "shortcuts" | "export">(null);
+  const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes" | "mixer" | "shortcuts" | "export" | "templates">(null);
 
   const flashStatus = useCallback((message: string) => {
     setStatusMessage(message);
@@ -2950,6 +3125,9 @@ export const MainLayout = () => {
         <button onClick={() => setModal("shortcuts")} title="Keyboard shortcuts" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
           <Keyboard size={12} />
         </button>
+        <button onClick={() => setModal("templates")} title="Motion graphics templates" className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-300 hover:border-accent/60">
+          <LayoutTemplate size={12} />
+        </button>
         <button
           onClick={() => setShowDiag(true)}
           title="Diagnostics"
@@ -3000,6 +3178,7 @@ export const MainLayout = () => {
       {modal === "scopes" && <ScopesPanel onClose={() => setModal(null)} />}
       {modal === "mixer" && <MixerPanel onClose={() => setModal(null)} />}
       {modal === "shortcuts" && <ShortcutsPanel onClose={() => setModal(null)} />}
+      {modal === "templates" && <TemplatesPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "export" && <ExportPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "sounds" && <SoundsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "projects" && <ProjectsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
