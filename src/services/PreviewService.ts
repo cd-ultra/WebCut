@@ -23,6 +23,7 @@ import {
   reduceEffects,
   sampleAnimatable,
   sampleClipSpeed,
+  sampleMaskPoints,
   type BlendMode,
   type ClipItem,
   type ColorGrade,
@@ -349,7 +350,12 @@ class PreviewService {
       sink.setLayerGrade(layerId, clip.grade ?? null);
       sink.setLayerTransition(layerId, transition);
       sink.setLayerEffectParams(layerId, reduceEffects(clip.effects, frame - clip.startFrame));
-      sink.setLayerMask(layerId, clip.mask ?? null);
+      // Rotoscoping (#60): sample the possibly-animated vertex positions at
+      // the clip-local frame before uploading the mask.
+      sink.setLayerMask(
+        layerId,
+        clip.mask ? { ...clip.mask, points: sampleMaskPoints(clip.mask, frame - clip.startFrame) } : null,
+      );
 
       if (asset.kind === "image") {
         const bitmap = await this.getImageBitmap(asset);
