@@ -1,5 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { Analytics } from "@vercel/analytics/react";
 import "./index.css";
 import { MainLayout } from "./components/MainLayout";
 
@@ -11,5 +12,6 @@ if (!rootElement) {
 createRoot(rootElement).render(
   <StrictMode>
     <MainLayout />
+    <Analytics />
   </StrictMode>,
 );
