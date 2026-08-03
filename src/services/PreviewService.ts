@@ -512,7 +512,9 @@ class PreviewService {
       video.muted = true;
       video.playsInline = true;
       video.preload = "auto";
-      video.crossOrigin = "anonymous";
+      // No crossOrigin: the source is a same-origin blob: URL. Setting
+      // crossOrigin forces CORS mode, which a blob response can't satisfy and
+      // which interacts badly with COEP:require-corp on the deployed build.
       await new Promise<void>((resolve, reject) => {
         video.onloadeddata = () => resolve();
         video.onerror = () => reject(new Error(`Cannot decode "${asset.name}"`));
