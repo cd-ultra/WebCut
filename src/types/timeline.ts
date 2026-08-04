@@ -344,8 +344,21 @@ export interface MediaAsset {
   /**
    * Serialized reference to a FileSystemFileHandle persisted in IndexedDB.
    * Local-first: we never copy media — we re-acquire the handle on load.
+   *
+   * Scoped to ONE browser profile: a `handleKey` from another machine resolves
+   * to nothing. `contentHash` is what identifies the file across machines.
    */
   readonly handleKey: string;
+  /**
+   * Stable cross-machine identity — a sampled digest of the source bytes (see
+   * services/mediaHash.ts). Lets a project moved to another machine relink its
+   * media instead of dead-ending on a stale `handleKey`.
+   *
+   * Optional: absent on projects saved before hashing existed, and on imports
+   * made in an insecure context where WebCrypto is unavailable. Relinking
+   * falls back to matching on name + size in those cases.
+   */
+  readonly contentHash?: string;
   readonly durationFrames: number;
   readonly width?: number;
   readonly height?: number;

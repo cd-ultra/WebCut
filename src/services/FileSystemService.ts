@@ -49,6 +49,12 @@ declare global {
   interface Window {
     showOpenFilePicker?: (options?: OpenFilePickerOptions) => Promise<FileSystemFileHandle[]>;
     showSaveFilePicker?: (options?: SaveFilePickerOptions) => Promise<FileSystemFileHandle>;
+    showDirectoryPicker?: (options?: { id?: string; mode?: "read" | "readwrite" }) => Promise<FileSystemDirectoryHandle>;
+  }
+
+  /** Async iteration over a directory's entries — used by the relink scan. */
+  interface FileSystemDirectoryHandle {
+    values(): AsyncIterableIterator<FileSystemDirectoryHandle | FileSystemFileHandle>;
   }
 }
 
@@ -189,13 +195,24 @@ export class FileSystemService {
 
     const imported: ImportedMediaFile[] = [];
     for (const handle of handles) {
-      const handleKey = `media:${crypto.randomUUID()}`;
-      const file = await handle.getFile();
-      this.handleCache.set(handleKey, handle);
-      await idbPut(handleKey, handle);
-      imported.push({ handleKey, file, handle });
+      const handleKey = await this.registerMediaHandle(handle);
+      imported.push({ handleKey, file: await handle.getFile(), handle });
     }
     return imported;
+  }
+
+  /**
+   * Persist a file handle and return its durable key.
+   *
+   * Shared by the import picker and the relink flow. Relinking must go through
+   * here rather than `registerBlobFile` — that copies the whole file into
+   * IndexedDB, which would duplicate a multi-gigabyte source on every relink.
+   */
+  async registerMediaHandle(handle: FileSystemFileHandle): Promise<string> {
+    const handleKey = `media:${crypto.randomUUID()}`;
+    this.handleCache.set(handleKey, handle);
+    await idbPut(handleKey, handle);
+    return handleKey;
   }
 
   /**
@@ -207,6 +224,40 @@ export class FileSystemService {
     this.blobCache.set(handleKey, file);
     await idbPut(handleKey, file);
     return handleKey;
+  }
+
+  /**
+   * Non-invasive availability check for a handle key.
+   *
+   * Deliberately does NOT call `requestPermission` the way `resolveMediaFile`
+   * does: that needs a user gesture, so probing a whole project on load would
+   * both fail and pop a prompt per asset. Use this to survey a project;
+   * use `resolveMediaFile` when actually about to read.
+   *
+   *  - `ok`                — readable right now
+   *  - `needs-permission`  — the handle exists but this session hasn't been
+   *                          granted read access yet (the normal state after a
+   *                          reload; resolved lazily on first real read)
+   *  - `missing`           — nothing stored under this key, e.g. a project made
+   *                          on another machine
+   */
+  async probeMediaAvailability(handleKey: string): Promise<"ok" | "needs-permission" | "missing"> {
+    if (this.blobCache.has(handleKey)) return "ok";
+    let handle = this.handleCache.get(handleKey);
+    if (!handle) {
+      const stored = await idbGet(handleKey);
+      if (stored instanceof File) {
+        this.blobCache.set(handleKey, stored);
+        return "ok";
+      }
+      if (!stored) return "missing";
+      handle = stored;
+      this.handleCache.set(handleKey, handle);
+    }
+    const permission = await handle.queryPermission?.({ mode: "read" });
+    // No queryPermission implementation ⇒ assume readable and let the real
+    // read surface any problem.
+    return permission === undefined || permission === "granted" ? "ok" : "needs-permission";
   }
 
   /** Re-acquire a File for a persisted handle key (e.g. after project load). */
