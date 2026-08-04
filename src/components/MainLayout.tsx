@@ -25,6 +25,7 @@ import {
   LayoutDashboard,
   LayoutTemplate,
   LayoutGrid,
+  Link2Off,
   List,
   Music,
   Plus,
@@ -47,6 +48,16 @@ import {
   isMediaFile,
   probeMedia,
 } from "../services/mediaImport";
+import { computeContentHash } from "../services/mediaHash";
+import {
+  backfillContentHashes,
+  canPickDirectory,
+  findMissingMedia,
+  relinkProject,
+  scanDirectory,
+  type MissingMedia,
+  type RelinkMatch,
+} from "../services/relinkMedia";
 import { projectStore, type ProjectSummary } from "../services/projectStore";
 import { SOUND_LIBRARY, soundToFile } from "../services/sounds";
 import { parseCaptions, toSrt } from "../services/subtitles";
@@ -367,6 +378,7 @@ const MediaPool = () => {
           kind,
           name: file.name,
           handleKey,
+          contentHash: await computeContentHash(file),
           durationFrames: Math.max(1, Math.round(probed.duration * frameRate)),
           width: probed.width || undefined,
           height: probed.height || undefined,
@@ -3462,6 +3474,159 @@ const DiagnosticsPanel = ({ onClose }: { onClose: () => void }) => {
 };
 
 // ---------------------------------------------------------------------------
+// Relink missing media
+// ---------------------------------------------------------------------------
+
+/**
+ * Shown when a loaded project references media this machine can't open —
+ * typically a `.webcut` opened somewhere other than where it was made, since
+ * `handleKey`s are scoped to one browser profile.
+ */
+const RelinkPanel = ({
+  missing,
+  onClose,
+  onResolved,
+  onStatus,
+}: {
+  missing: readonly MissingMedia[];
+  onClose: () => void;
+  /** Reports what is still missing after a relink, so the banner stays accurate. */
+  onResolved: (remaining: readonly MissingMedia[]) => void;
+  onStatus: (msg: string) => void;
+}) => {
+  const setProject = useTimelineStore((s) => s.setProject);
+  const [matches, setMatches] = useState<Map<MediaAssetId, RelinkMatch>>(new Map());
+  const [busy, setBusy] = useState(false);
+  const [scanned, setScanned] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  const assets = missing.map((entry) => entry.asset);
+  const pending = assets.filter((asset) => !matches.has(asset.id));
+
+  const locateFolder = async () => {
+    setError(null);
+    setBusy(true);
+    setScanned(0);
+    try {
+      const dir = await window.showDirectoryPicker!({ id: "webcut-relink", mode: "read" });
+      const found = await scanDirectory(dir, pending, setScanned);
+      if (found.size === 0) {
+        setError("No matching files in that folder. Try the folder that holds the original media.");
+      }
+      setMatches((current) => new Map([...current, ...found]));
+    } catch (pickError) {
+      if (!isUserAbort(pickError)) setError(pickError instanceof Error ? pickError.message : String(pickError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const locateOne = async (asset: MediaAsset) => {
+    setError(null);
+    try {
+      const [handle] = await window.showOpenFilePicker!({ multiple: false, id: "webcut-relink-file" });
+      if (!handle) return;
+      const file = await handle.getFile();
+      setMatches((current) => new Map(current).set(asset.id, { handle, file, quality: "name" }));
+    } catch (pickError) {
+      if (!isUserAbort(pickError)) setError(pickError instanceof Error ? pickError.message : String(pickError));
+    }
+  };
+
+  const apply = async () => {
+    setBusy(true);
+    try {
+      const relinked = await relinkProject(useTimelineStore.getState().project, matches);
+      setProject(relinked);
+      onResolved(missing.filter((entry) => !matches.has(entry.asset.id)));
+      onStatus(`Relinked ${matches.size} of ${assets.length} media file(s)`);
+      onClose();
+    } catch (applyError) {
+      setError(applyError instanceof Error ? applyError.message : String(applyError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const QUALITY_LABEL: Record<RelinkMatch["quality"], string> = {
+    hash: "exact match",
+    size: "name + size",
+    name: "name only",
+  };
+
+  return (
+    <Modal title="LOCATE MISSING MEDIA" icon={<Link2Off size={14} className="text-accent" />} wide onClose={onClose}>
+      <p className="mb-3 text-[11px] leading-relaxed text-neutral-400">
+        {assets.length} media file{assets.length === 1 ? "" : "s"} referenced by this project can’t be opened here.
+        WebCut never copies your media, so a project moved between machines needs its files pointed at again. Pick
+        the folder holding the originals and they’ll be matched automatically.
+      </p>
+
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <button
+          disabled={busy || !canPickDirectory() || pending.length === 0}
+          onClick={locateFolder}
+          className="rounded bg-accent/80 px-2 py-1 text-[11px] text-white hover:bg-accent disabled:opacity-40"
+        >
+          {busy ? `Scanning… ${scanned}` : "Locate folder…"}
+        </button>
+        <button
+          disabled={busy || matches.size === 0}
+          onClick={apply}
+          className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-200 hover:border-accent/60 disabled:opacity-40"
+        >
+          Relink {matches.size > 0 ? `${matches.size} file(s)` : ""}
+        </button>
+        <button
+          disabled={busy}
+          onClick={onClose}
+          className="rounded border border-edge px-2 py-1 text-[11px] text-neutral-400 hover:border-accent/60 disabled:opacity-40"
+        >
+          Skip for now
+        </button>
+      </div>
+
+      {error && <p className="mb-2 text-[10px] text-red-400">{error}</p>}
+      {!canPickDirectory() && (
+        <p className="mb-2 text-[10px] text-neutral-500">
+          Folder scanning needs a Chromium-based browser; use “Locate…” per file instead.
+        </p>
+      )}
+
+      <div className="max-h-[45vh] overflow-y-auto pr-1">
+        {missing.map(({ asset }) => {
+          const match = matches.get(asset.id);
+          return (
+            <div key={asset.id} className="flex items-center gap-2 border-b border-edge/40 py-1.5">
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-[11px] text-neutral-200">{asset.name}</p>
+                <p className="truncate text-[10px] text-neutral-500">
+                  {(asset.fileSizeBytes / 1_000_000).toFixed(1)} MB
+                  {asset.contentHash ? "" : " · no content hash (matched by name/size)"}
+                </p>
+              </div>
+              {match ? (
+                <span className="shrink-0 rounded bg-emerald-500/20 px-1.5 py-0.5 text-[9px] text-emerald-300">
+                  {QUALITY_LABEL[match.quality]}
+                </span>
+              ) : (
+                <button
+                  disabled={busy}
+                  onClick={() => void locateOne(asset)}
+                  className="shrink-0 rounded border border-edge px-1.5 py-0.5 text-[9px] text-neutral-300 hover:border-accent/60 disabled:opacity-40"
+                >
+                  Locate…
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Modal>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Modals: subtitles, sounds, projects
 // ---------------------------------------------------------------------------
 
@@ -3801,10 +3966,38 @@ export const MainLayout = () => {
   const [showDiag, setShowDiag] = useState(false);
   const [modal, setModal] = useState<null | "subtitles" | "sounds" | "projects" | "scopes" | "mixer" | "shortcuts" | "export" | "templates" | "motionTrack">(null);
 
+  // `missingMedia` is what's known to be unresolvable; `showRelink` is whether
+  // the dialog is up. Kept separate so dismissing it leaves the media-pool
+  // banner as a way back in, rather than stranding the user.
+  const [missingMedia, setMissingMedia] = useState<readonly MissingMedia[] | null>(null);
+  const [showRelink, setShowRelink] = useState(false);
+
   const flashStatus = useCallback((message: string) => {
     setStatusMessage(message);
     window.setTimeout(() => setStatusMessage(null), 2500);
   }, []);
+
+  // Whenever a different project is loaded — from disk, from the library, or
+  // at startup — check that its media still resolves here. Keying on the
+  // project id covers every load path with one hook, including future ones.
+  const loadedProjectId = useTimelineStore((state) => state.project.id);
+  const updateAsset = useTimelineStore((state) => state.updateAsset);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const loaded = useTimelineStore.getState().project;
+      const missing = await findMissingMedia(loaded);
+      if (cancelled) return;
+      setMissingMedia(missing.length > 0 ? missing : null);
+      setShowRelink(missing.length > 0);
+      // Opportunistically give older projects a content hash so they become
+      // portable just by being opened once.
+      await backfillContentHashes(loaded, updateAsset);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loadedProjectId, updateAsset]);
 
   // Paste-to-import: media files on the clipboard become assets (no picker).
   useEffect(() => {
@@ -3998,8 +4191,20 @@ export const MainLayout = () => {
 
       {/* Workspace */}
       <div className="flex min-h-0 flex-[3] border-b border-edge">
-        <aside className="w-60 shrink-0 border-r border-edge bg-panel-deep">
-          <MediaPool />
+        <aside className="flex w-60 shrink-0 flex-col border-r border-edge bg-panel-deep">
+          {missingMedia && missingMedia.length > 0 && !showRelink && (
+            <button
+              onClick={() => setShowRelink(true)}
+              title="Some media referenced by this project can't be opened on this machine"
+              className="flex shrink-0 items-center gap-1.5 border-b border-amber-500/40 bg-amber-500/15 px-2 py-1.5 text-left text-[10px] text-amber-200 hover:bg-amber-500/25"
+            >
+              <Link2Off size={11} className="shrink-0" />
+              {missingMedia.length} media file{missingMedia.length === 1 ? "" : "s"} missing — relink
+            </button>
+          )}
+          <div className="min-h-0 flex-1">
+            <MediaPool />
+          </div>
         </aside>
         <main className="min-w-0 flex-1">
           <VideoPlayer />
@@ -4024,6 +4229,14 @@ export const MainLayout = () => {
       {modal === "export" && <ExportPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "sounds" && <SoundsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
       {modal === "projects" && <ProjectsPanel onClose={() => setModal(null)} onStatus={flashStatus} />}
+      {showRelink && missingMedia && missingMedia.length > 0 && (
+        <RelinkPanel
+          missing={missingMedia}
+          onClose={() => setShowRelink(false)}
+          onResolved={(remaining) => setMissingMedia(remaining.length > 0 ? remaining : null)}
+          onStatus={flashStatus}
+        />
+      )}
     </div>
   );
 };

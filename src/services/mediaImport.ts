@@ -7,6 +7,7 @@
  */
 
 import { fileSystemService } from "./FileSystemService";
+import { computeContentHash } from "./mediaHash";
 import { createId, type MediaAsset, type MediaAssetId, type MediaKind } from "../types/timeline";
 
 const VIDEO_EXTENSIONS = /\.(mp4|mov|m4v|webm|mkv|avi|mts|m2ts)$/i;
@@ -94,12 +95,14 @@ export const ingestFiles = async (
     const kind = classifyMedia(file.type || "", file.name);
     const handleKey = await fileSystemService.registerBlobFile(file);
     const probed = await probeMedia(file, kind);
+    const contentHash = await computeContentHash(file);
     const id = createId<MediaAssetId>();
     assets.push({
       id,
       kind,
       name: file.name || `Pasted ${kind}`,
       handleKey,
+      contentHash,
       durationFrames: Math.max(1, Math.round(probed.duration * frameRate)),
       width: probed.width || undefined,
       height: probed.height || undefined,
